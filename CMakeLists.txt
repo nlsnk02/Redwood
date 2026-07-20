@@ -28,6 +28,7 @@ enable_testing()
 add_executable(cbtree_tests
   tests/test_types_smoke.cpp
   tests/test_fingerprint.cpp
+  tests/test_key_lock_table.cpp
 )
 target_link_libraries(cbtree_tests PRIVATE cbtree GTest::gtest_main)
 include(GoogleTest)
