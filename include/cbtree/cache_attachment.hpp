@@ -22,7 +22,7 @@ struct CacheSlot {
 class CacheAttachment {
  public:
   Status upsert(Key k, Value v);
-  LookupResult lookup(Key k) const;
+  LookupResult lookup(Key k);
   bool has_absent(Key k) const;
   Status mark_absent(Key k);
   Status try_place_placeholder(Key k, int* out_idx);

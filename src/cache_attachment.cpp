@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "cbtree/cache_attachment.hpp"
 #include "cbtree/fingerprint.hpp"
 
@@ -48,7 +49,7 @@ Status CacheAttachment::upsert(Key k, Value v) {
   return Status::Ok;
 }
 
-LookupResult CacheAttachment::lookup(Key k) const {
+LookupResult CacheAttachment::lookup(Key k) {
   Fingerprint fp = fingerprint(k);
   for (int i = 0; i < kCacheSlots; ++i) {
     SlotState st = slots_[i].state;
@@ -57,6 +58,7 @@ LookupResult CacheAttachment::lookup(Key k) const {
     if (slots_[i].key != k) continue;
 
     if (st == SlotState::Occupied) {
+      slots_[i].clock_bit.store(true, std::memory_order_release);
       return {Status::Ok, slots_[i].value};
     }
     // Placeholder or Absent -- not a hit
@@ -198,17 +200,111 @@ int CacheAttachment::occupied_count() const {
   return count;
 }
 
-// Stub implementations for future tasks (not required for Task 4)
-Status CacheAttachment::pick_clock_victim(Key*, Value*, bool*) {
-  return Status::NotImplemented;
+Status CacheAttachment::pick_clock_victim(Key* out_key, Value* out_val,
+                                         bool* out_dirty) {
+  if (!out_key || !out_val || !out_dirty) return Status::Error;
+
+  // Scan up to 2 * kCacheSlots positions so that even when every
+  // occupied slot starts with clock_bit == true the first pass
+  // clears all bits and the second pass finds a victim.
+  for (int round = 0; round < 2 * kCacheSlots; ++round) {
+    size_t idx = hand_.load(std::memory_order_relaxed);
+    hand_.store((idx + 1) % kCacheSlots, std::memory_order_relaxed);
+
+    SlotState st = slots_[idx].state;
+    if (st == SlotState::Empty) continue;
+    if (st == SlotState::Placeholder) continue;
+
+    // OCCUPIED or ABSENT -- check clock bit
+    bool bit = slots_[idx].clock_bit.load(std::memory_order_acquire);
+    if (bit) {
+      slots_[idx].clock_bit.store(false, std::memory_order_release);
+      continue;  // give it a second chance
+    }
+
+    // Candidate found -- lock and verify
+    {
+      std::lock_guard<std::mutex> lock(slots_[idx].slot_mutex);
+      SlotState locked_st = slots_[idx].state;
+      if (locked_st != SlotState::Occupied &&
+          locked_st != SlotState::Absent) {
+        continue;  // state changed
+      }
+      if (slots_[idx].clock_bit.load(std::memory_order_acquire)) {
+        continue;  // someone touched it
+      }
+      // It's ours
+      *out_key = slots_[idx].key;
+      *out_val = slots_[idx].value;
+      *out_dirty = slots_[idx].dirty;
+      slots_[idx].state = SlotState::Empty;
+      slots_[idx].clock_bit.store(false, std::memory_order_release);
+    }
+    return Status::Ok;
+  }
+
+  // Fallback: all non-empty slots are PLACEHOLDERs -- evict the first one
+  for (int i = 0; i < kCacheSlots; ++i) {
+    if (slots_[i].state != SlotState::Placeholder) continue;
+
+    std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
+    if (slots_[i].state != SlotState::Placeholder) continue;
+
+    *out_key = slots_[i].key;
+    *out_val = 0;
+    *out_dirty = false;
+    slots_[i].state = SlotState::Empty;
+    return Status::Ok;
+  }
+
+  return Status::Error;  // nothing to evict
 }
 
-Status CacheAttachment::split_into(Key, CacheAttachment*) {
-  return Status::NotImplemented;
+Status CacheAttachment::split_into(Key mid, CacheAttachment* right) {
+  if (!right) return Status::Error;
+
+  for (int i = 0; i < kCacheSlots; ++i) {
+    if (slots_[i].state == SlotState::Empty) continue;
+    if (slots_[i].key < mid) continue;
+
+    // Find an empty slot in the right cache
+    int right_empty = -1;
+    for (int j = 0; j < kCacheSlots; ++j) {
+      if (right->slots_[j].state == SlotState::Empty) {
+        right_empty = j;
+        break;
+      }
+    }
+    if (right_empty < 0) return Status::Full;
+
+    // Copy slot contents to right (mutex is not copyable)
+    right->slots_[right_empty].state = slots_[i].state;
+    right->slots_[right_empty].key = slots_[i].key;
+    right->slots_[right_empty].value = slots_[i].value;
+    right->slots_[right_empty].fp = slots_[i].fp;
+    right->slots_[right_empty].dirty = slots_[i].dirty;
+    right->slots_[right_empty].clock_bit.store(false,
+                                                std::memory_order_release);
+
+    // Clear the left slot
+    slots_[i].state = SlotState::Empty;
+    slots_[i].clock_bit.store(false, std::memory_order_release);
+  }
+
+  clear_sorted_flag();
+  right->clear_sorted_flag();
+  return Status::Ok;
 }
 
 std::vector<std::pair<Key, Value>> CacheAttachment::occupied_sorted() {
-  return {};
+  std::vector<std::pair<Key, Value>> result;
+  for (int i = 0; i < kCacheSlots; ++i) {
+    if (slots_[i].state == SlotState::Occupied) {
+      result.emplace_back(slots_[i].key, slots_[i].value);
+    }
+  }
+  std::sort(result.begin(), result.end());
+  return result;
 }
 
 }  // namespace cbtree
