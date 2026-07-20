@@ -36,6 +36,9 @@ Status CacheAttachment::upsert(Key k, Value v) {
   }
 
   std::lock_guard<std::mutex> lock(slots_[empty].slot_mutex);
+  if (slots_[empty].state != SlotState::Empty) {
+    return Status::Full;  // claimed by another thread
+  }
   slots_[empty].fp = fp;
   slots_[empty].key = k;
   slots_[empty].value = v;
@@ -104,6 +107,9 @@ Status CacheAttachment::mark_absent(Key k) {
   }
 
   std::lock_guard<std::mutex> lock(slots_[empty].slot_mutex);
+  if (slots_[empty].state != SlotState::Empty) {
+    return Status::Full;  // claimed by another thread
+  }
   slots_[empty].fp = fp;
   slots_[empty].key = k;
   slots_[empty].state = SlotState::Absent;
@@ -139,6 +145,9 @@ Status CacheAttachment::try_place_placeholder(Key k, int* out_idx) {
   }
 
   std::lock_guard<std::mutex> lock(slots_[empty].slot_mutex);
+  if (slots_[empty].state != SlotState::Empty) {
+    return Status::Full;  // claimed by another thread
+  }
   slots_[empty].fp = fp;
   slots_[empty].key = k;
   slots_[empty].state = SlotState::Placeholder;
