@@ -33,6 +33,7 @@ Status CacheAttachment::upsert(Key k, Value v) {
       slots_[i].state = SlotState::Occupied;
       slots_[i].dirty = true;
       slots_[i].clock_bit.store(true, std::memory_order_release);
+      slots_[i].generation.fetch_add(1, std::memory_order_relaxed);
       return Status::Ok;
     }
   }
@@ -96,6 +97,7 @@ Status CacheAttachment::mark_absent(Key k) {
       slots_[i].key = k;
       slots_[i].state = SlotState::Absent;
       slots_[i].dirty = true;
+      slots_[i].generation.fetch_add(1, std::memory_order_relaxed);
       return Status::Ok;
     }
   }
@@ -125,6 +127,7 @@ Status CacheAttachment::try_place_placeholder(Key k, int* out_idx) {
       slots_[i].fp = fp;
       slots_[i].key = k;
       slots_[i].state = SlotState::Placeholder;
+      slots_[i].generation.fetch_add(1, std::memory_order_relaxed);
       if (out_idx) *out_idx = i;
       return Status::Ok;
     }
@@ -199,8 +202,7 @@ Status CacheAttachment::pick_clock_victim(Key* out_key, Value* out_val,
   // occupied slot starts with clock_bit == true the first pass
   // clears all bits and the second pass finds a victim.
   for (int round = 0; round < 2 * kCacheSlots; ++round) {
-    size_t idx = hand_.load(std::memory_order_relaxed);
-    hand_.store((idx + 1) % kCacheSlots, std::memory_order_relaxed);
+    size_t idx = hand_.fetch_add(1, std::memory_order_relaxed) % kCacheSlots;
 
     // Lock slot to safely read state
     {
@@ -252,12 +254,12 @@ Status CacheAttachment::pick_clock_victim(Key* out_key, Value* out_val,
 }
 
 Status CacheAttachment::find_clock_victim(Key* out_key, Value* out_val,
-                                       bool* out_dirty, int* out_idx) {
-  if (!out_key || !out_val || !out_dirty || !out_idx) return Status::Error;
+                                       bool* out_dirty, int* out_idx,
+                                       uint32_t* out_gen) {
+  if (!out_key || !out_val || !out_dirty || !out_idx || !out_gen) return Status::Error;
 
   for (int round = 0; round < 2 * kCacheSlots; ++round) {
-    size_t idx = hand_.load(std::memory_order_relaxed);
-    hand_.store((idx + 1) % kCacheSlots, std::memory_order_relaxed);
+    size_t idx = hand_.fetch_add(1, std::memory_order_relaxed) % kCacheSlots;
 
     {
       std::lock_guard<std::mutex> lock(slots_[idx].slot_mutex);
@@ -280,11 +282,12 @@ Status CacheAttachment::find_clock_victim(Key* out_key, Value* out_val,
         continue;
       }
 
-      // Found victim -- copy data but do NOT clear (caller must call evict_slot)
+      // Found victim -- copy data + generation snapshot (does NOT clear)
       *out_key = slots_[idx].key;
       *out_val = slots_[idx].value;
       *out_dirty = slots_[idx].dirty;
       *out_idx = static_cast<int>(idx);
+      *out_gen = slots_[idx].generation.load(std::memory_order_acquire);
     }
     return Status::Ok;
   }
@@ -298,24 +301,28 @@ Status CacheAttachment::find_clock_victim(Key* out_key, Value* out_val,
     *out_val = 0;
     *out_dirty = false;
     *out_idx = i;
+    *out_gen = slots_[i].generation.load(std::memory_order_acquire);
     return Status::Ok;
   }
 
   return Status::Error;
 }
 
-void CacheAttachment::evict_slot(int idx, Key expected_key) {
-  if (idx < 0 || idx >= kCacheSlots) return;
+bool CacheAttachment::evict_slot(int idx, Key expected_key, uint32_t expected_gen) {
+  if (idx < 0 || idx >= kCacheSlots) return false;
   std::lock_guard<std::mutex> lock(slots_[idx].slot_mutex);
-  // Verify the slot still contains the key we expect to evict.
-  // If another thread repurposed this slot (e.g. after another
-  // find_clock_victim selected the same slot and a new upsert
-  // claimed it), we must NOT clear it.
-  if (slots_[idx].key != expected_key) return;
+  // Verify the slot still contains the same key+generation we selected.
+  // A generation mismatch means another thread recycled the slot (ABA).
+  if (slots_[idx].key != expected_key) return false;
+  if (slots_[idx].generation.load(std::memory_order_acquire) != expected_gen)
+    return false;
+  // Allow clearing Occupied, Absent, and Placeholder states (C1 fix).
   if (slots_[idx].state != SlotState::Occupied &&
-      slots_[idx].state != SlotState::Absent) return;
+      slots_[idx].state != SlotState::Absent &&
+      slots_[idx].state != SlotState::Placeholder) return false;
   slots_[idx].state = SlotState::Empty;
   slots_[idx].clock_bit.store(false, std::memory_order_release);
+  return true;
 }
 
 Status CacheAttachment::split_into(Key mid, CacheAttachment* right) {

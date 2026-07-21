@@ -70,8 +70,9 @@ Status Tree::evict_leaf_if_needed(Node* leaf) {
   Value victim_val = 0;
   bool victim_dirty = false;
   int victim_idx = -1;
+  uint32_t victim_gen = 0;
   if (leaf->cache->find_clock_victim(&victim_key, &victim_val, &victim_dirty,
-                                     &victim_idx) != Status::Ok)
+                                     &victim_idx, &victim_gen) != Status::Ok)
     return Status::Ok;
 
   if (victim_dirty) {
@@ -80,8 +81,8 @@ Status Tree::evict_leaf_if_needed(Node* leaf) {
     if (write_s != Status::Ok) return Status::Ok;  // leave slot intact on failure
     register_in_leaf_index(leaf, victim_key);
   }
-  // Now clear the slot (verified against victim_key)
-  leaf->cache->evict_slot(victim_idx, victim_key);
+  // Now clear the slot (verified against victim_key + gen)
+  leaf->cache->evict_slot(victim_idx, victim_key, victim_gen);
   return Status::Ok;
 }
 
@@ -93,8 +94,9 @@ Status Tree::evict_parent_if_needed(Node* parent) {
   Value victim_val = 0;
   bool victim_dirty = false;
   int victim_idx = -1;
+  uint32_t victim_gen = 0;
   if (parent->cache->find_clock_victim(&victim_key, &victim_val, &victim_dirty,
-                                       &victim_idx) != Status::Ok)
+                                       &victim_idx, &victim_gen) != Status::Ok)
     return Status::Ok;
 
   if (victim_dirty) {
@@ -105,8 +107,8 @@ Status Tree::evict_parent_if_needed(Node* parent) {
     // Insert into leaf cache
     leaf->cache->upsert(victim_key, victim_val);
   }
-  // Now clear the slot (verified against victim_key)
-  parent->cache->evict_slot(victim_idx, victim_key);
+  // Now clear the slot (verified against victim_key + gen)
+  parent->cache->evict_slot(victim_idx, victim_key, victim_gen);
   return Status::Ok;
 }
 
@@ -139,15 +141,17 @@ Status Tree::put(Key k, Value v) {
         Value victim_val = 0;
         bool victim_dirty = false;
         int victim_idx = -1;
+        uint32_t victim_gen = 0;
         Status evict_s = root_->cache->find_clock_victim(&victim_key, &victim_val,
-                                                         &victim_dirty, &victim_idx);
+                                                         &victim_dirty, &victim_idx,
+                                                         &victim_gen);
         if (evict_s != Status::Ok) return Status::Full;
         if (victim_dirty) {
           Node* leaf = find_leaf_for_key(root_, victim_key);
           evict_leaf_if_needed(leaf);
           leaf->cache->upsert(victim_key, victim_val);
         }
-        root_->cache->evict_slot(victim_idx, victim_key);
+        root_->cache->evict_slot(victim_idx, victim_key, victim_gen);
         // Loop back to retry upsert
       }
       return Status::Full;
@@ -178,15 +182,17 @@ Status Tree::put(Key k, Value v) {
         Value victim_val = 0;
         bool victim_dirty = false;
         int victim_idx = -1;
+        uint32_t victim_gen = 0;
         Status evict_s = root_->cache->find_clock_victim(&victim_key, &victim_val,
-                                                         &victim_dirty, &victim_idx);
+                                                         &victim_dirty, &victim_idx,
+                                                         &victim_gen);
         if (evict_s != Status::Ok) return Status::Full;
         if (victim_dirty) {
           Node* leaf = find_leaf_for_key(root_, victim_key);
           evict_leaf_if_needed(leaf);
           leaf->cache->upsert(victim_key, victim_val);
         }
-        root_->cache->evict_slot(victim_idx, victim_key);
+        root_->cache->evict_slot(victim_idx, victim_key, victim_gen);
         // Loop back to retry upsert
       }
       return Status::Full;
@@ -214,9 +220,11 @@ Status Tree::put(Key k, Value v) {
     Value victim_val = 0;
     bool victim_dirty = false;
     int victim_idx = -1;
+    uint32_t victim_gen = 0;
 
     Status evict_s = leaf->cache->find_clock_victim(&victim_key, &victim_val,
-                                                    &victim_dirty, &victim_idx);
+                                                    &victim_dirty, &victim_idx,
+                                                    &victim_gen);
     if (evict_s != Status::Ok) {
       return Status::Full;  // nothing to evict (should not happen)
     }
@@ -229,8 +237,8 @@ Status Tree::put(Key k, Value v) {
       }
       register_in_leaf_index(leaf, victim_key);
     }
-    // Now clear the slot (verified against victim_key)
-    leaf->cache->evict_slot(victim_idx, victim_key);
+    // Now clear the slot (verified against victim_key + gen)
+    leaf->cache->evict_slot(victim_idx, victim_key, victim_gen);
     // Loop back to retry upsert
   }
   return Status::Full;

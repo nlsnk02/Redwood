@@ -17,6 +17,7 @@ struct CacheSlot {
   bool dirty{false};
   std::atomic<bool> clock_bit{false};
   mutable std::mutex slot_mutex;
+  std::atomic<uint32_t> generation{0};  // incremented on reuse, for ABA detection
 };
 
 class CacheAttachment {
@@ -42,12 +43,13 @@ class CacheAttachment {
 
   // Future tasks: declared only, not implemented in Task 4
   Status pick_clock_victim(Key* out_key, Value* out_val, bool* out_dirty);
-  // Two-phase eviction: find victim without clearing, then evict after SSD write
+  // Two-phase eviction: find victim without clearing, then evict after SSD write.
+  // Captures slot generation for ABA detection.
   Status find_clock_victim(Key* out_key, Value* out_val, bool* out_dirty,
-                           int* out_idx);
-  // Verify key matches before clearing (prevents clearing a slot that was
-  // repurposed by another thread after find_clock_victim).
-  void evict_slot(int idx, Key expected_key);
+                           int* out_idx, uint32_t* out_gen);
+  // Verify key + generation match before clearing. Aborts if slot was recycled.
+  // Returns true if slot was cleared, false if generation/stale mismatch.
+  bool evict_slot(int idx, Key expected_key, uint32_t expected_gen);
   Status split_into(Key mid, CacheAttachment* right);
   std::vector<std::pair<Key, Value>> occupied_sorted();
   void flush_dirty(std::vector<std::pair<Key, Value>>& out);
