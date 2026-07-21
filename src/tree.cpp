@@ -63,7 +63,7 @@ Status Tree::put(Key k, Value v) {
 LookupResult Tree::get(Key k) {
   constexpr int kMaxRetries = 64;
 
-  // Per-call random engine for placeholder probability
+  // Per-thread random engine for placeholder probability
   thread_local std::mt19937_64 rng(std::random_device{}());
 
   for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
@@ -114,8 +114,20 @@ LookupResult Tree::get(Key k) {
       }
       continue;  // version changed, retry
     }
+    if (root_->cache->has_absent(k)) {
+      // ABSENT entry found (concurrent get): cache authority over SSD
+      if (has_placed) {
+        root_->cache->fill_placeholder_absent(placeholder_idx);
+      }
+      if (root_->version.load(std::memory_order_acquire) == v) {
+        return {Status::NotFound};
+      }
+      continue;  // version changed, retry
+    }
 
     // Step 6: fill placeholder based on SSD result
+    // fill_placeholder / fill_placeholder_absent failures are benign:
+    // the version check + retry loop recovers if the slot was evicted/filled concurrently.
     if (has_placed) {
       if (r.status == Status::Ok) {
         root_->cache->fill_placeholder(placeholder_idx, r.value);
