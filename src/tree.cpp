@@ -78,6 +78,12 @@ Status Tree::evict_leaf_if_needed(Node* leaf) {
   if (victim_dirty) {
     // Write to SSD BEFORE clearing the slot (prevents get() from missing)
     Status write_s = ssd_->put_record(leaf->page_id, victim_key, victim_val);
+    if (write_s == Status::Full) {
+      // SSD page is full — flush and split, then retry eviction
+      flush_and_split_leaf(leaf);
+      // Re-find a victim after split (the leaf may have changed)
+      return Status::Ok;  // caller will retry if needed
+    }
     if (write_s != Status::Ok) return Status::Ok;  // leave slot intact on failure
     register_in_leaf_index(leaf, victim_key);
   }
@@ -110,6 +116,23 @@ Status Tree::evict_parent_if_needed(Node* parent) {
   // Now clear the slot (verified against victim_key + gen)
   parent->cache->evict_slot(victim_idx, victim_key, victim_gen);
   return Status::Ok;
+}
+
+void Tree::flush_and_split_leaf(Node* leaf) {
+  std::lock_guard<std::mutex> lock(leaf->leaf_index_mutex);
+
+  // Sort and deduplicate leaf_keys (entries already successfully on SSD)
+  std::sort(leaf->leaf_keys.begin(), leaf->leaf_keys.end());
+  auto last = std::unique(leaf->leaf_keys.begin(), leaf->leaf_keys.end());
+  leaf->leaf_keys.erase(last, leaf->leaf_keys.end());
+  leaf->leaf_page_ids.assign(leaf->leaf_keys.size(), leaf->page_id);
+
+  // Split if leaf index exceeds fanout.
+  // Dirty cache entries stay dirty — they'll be written to new (non-full)
+  // pages on next eviction.
+  if (leaf->leaf_keys.size() > kLeafFanout) {
+    split_leaf(leaf);
+  }
 }
 
 Status Tree::put(Key k, Value v) {
@@ -232,6 +255,12 @@ Status Tree::put(Key k, Value v) {
     // Write dirty victim to SSD BEFORE clearing the slot
     if (victim_dirty) {
       Status write_s = ssd_->put_record(leaf->page_id, victim_key, victim_val);
+      if (write_s == Status::Full) {
+        // SSD page is full — flush and split, then re-descend to correct leaf
+        flush_and_split_leaf(leaf);
+        leaf = descend_to_leaf(k, versions);
+        continue;
+      }
       if (write_s != Status::Ok) {
         return Status::Error;
       }

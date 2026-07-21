@@ -59,6 +59,7 @@ class Tree {
   void register_in_leaf_index(Node* leaf, Key k);
   Status evict_leaf_if_needed(Node* leaf);
   Status evict_parent_if_needed(Node* parent);
+  void flush_and_split_leaf(Node* leaf);
 
   Node* root_;
   std::unique_ptr<SsDPageStore> ssd_;
