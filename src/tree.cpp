@@ -1,6 +1,7 @@
 // src/tree.cpp
 #include "cbtree/tree.hpp"
 #include "cbtree/cache_attachment.hpp"
+#include <random>
 
 namespace cbtree {
 
@@ -62,32 +63,68 @@ Status Tree::put(Key k, Value v) {
 LookupResult Tree::get(Key k) {
   constexpr int kMaxRetries = 64;
 
+  // Per-call random engine for placeholder probability
+  thread_local std::mt19937_64 rng(std::random_device{}());
+
   for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
-    // Step 1: read version before lookup
+    // Step 1: read version before lookup (must be even)
     uint64_t v = root_->version.load(std::memory_order_acquire);
-    if (v & 1) {                                // odd = structural change in progress
-      continue;                                 // spin/retry
+    if (v & 1) {  // odd = structural change in progress
+      continue;   // spin/retry
     }
 
-    // Step 2: cache lookup
+    // Step 2: cache lookup (top-down, includes fingerprint pre-filter)
     LookupResult r = root_->cache->lookup(k);
     if (r.status == Status::Ok) {
-      return r;
+      return r;  // OCCUPIED hit -- return value
     }
     if (root_->cache->has_absent(k)) {
-      return {Status::NotFound};
+      return {Status::NotFound};  // ABSENT hit -- return NotFound
     }
 
-    // Step 3: cache miss -- query SSD
+    // Step 3: cache miss -- try place placeholder with P_placeholder probability
+    // At most one placeholder per get (has_placed flag)
+    bool has_placed = false;
+    int placeholder_idx = -1;
+    if (p_placeholder_ >= 1.0) {
+      // Deterministic: always place (test hook)
+      Status ps = root_->cache->try_place_placeholder(k, &placeholder_idx);
+      has_placed = (ps == Status::Ok);
+    } else if (p_placeholder_ > 0.0) {
+      if (std::bernoulli_distribution{p_placeholder_}(rng)) {
+        Status ps = root_->cache->try_place_placeholder(k, &placeholder_idx);
+        has_placed = (ps == Status::Ok);
+      }
+    }
+
+    // Step 4: query SSD
     r = ssd_->get_record(root_->page_id, k);
 
-    // Step 4: secondary cache check after SSD read
+    // Step 5: post-SSD secondary cache recheck
     LookupResult r2 = root_->cache->lookup(k);
     if (r2.status == Status::Ok) {
-      r = r2;  // prefer cache hit, but still must validate version below
+      // Cache hit after SSD read -- prefer cache
+      // If we placed a placeholder, fill it with the cached value
+      if (has_placed) {
+        root_->cache->fill_placeholder(placeholder_idx, r2.value);
+      }
+      // Version check -- only return if stable
+      if (root_->version.load(std::memory_order_acquire) == v) {
+        return r2;
+      }
+      continue;  // version changed, retry
     }
 
-    // Step 5: version check after read (applies to both SSD and post-SSD cache paths)
+    // Step 6: fill placeholder based on SSD result
+    if (has_placed) {
+      if (r.status == Status::Ok) {
+        root_->cache->fill_placeholder(placeholder_idx, r.value);
+      } else {
+        root_->cache->fill_placeholder_absent(placeholder_idx);
+      }
+    }
+
+    // Step 7: version check after read (SSD or post-SSD cache paths)
     if (root_->version.load(std::memory_order_acquire) == v) {
       return r;
     }
