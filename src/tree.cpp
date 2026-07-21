@@ -2,7 +2,9 @@
 #include "cbtree/tree.hpp"
 #include "cbtree/cache_attachment.hpp"
 #include <algorithm>
+#include <map>
 #include <random>
+#include <set>
 
 namespace cbtree {
 
@@ -230,6 +232,118 @@ Status Tree::put(Key k, Value v) {
   }
 
   return s;
+}
+
+void Tree::collect_leaves_in_range(Node* node, Key lo, Key hi,
+                                    std::vector<Node*>& leaves) {
+  if (!node) return;
+  if (node->height == 1) {
+    leaves.push_back(node);
+    return;
+  }
+
+  // Determine which children overlap [lo, hi]
+  // separator[i] partitions children[i] (< s[i]) and children[i+1] (>= s[i])
+  // upper_bound(k) returns first separator > k, which is the child index for k
+  size_t lo_idx =
+      std::upper_bound(node->separators.begin(), node->separators.end(), lo) -
+      node->separators.begin();
+  size_t hi_idx =
+      std::upper_bound(node->separators.begin(), node->separators.end(), hi) -
+      node->separators.begin();
+
+  for (size_t i = lo_idx; i <= hi_idx && i < node->children.size(); ++i) {
+    collect_leaves_in_range(node->children[i], lo, hi, leaves);
+  }
+}
+
+std::vector<std::pair<Key, Value>> Tree::scan(Key lo, Key hi) {
+  // 1. Find leaves overlapping [lo, hi]
+  std::vector<Node*> leaves;
+  collect_leaves_in_range(root_, lo, hi, leaves);
+
+  if (leaves.empty()) return {};
+
+  // 2. Build result map: key -> (value, authority)
+  //    authority: 0 = parent cache (highest), 1 = leaf cache, 2 = SSD (lowest)
+  //    A negative authority (-1) means the key was marked ABSENT by a cache.
+  struct AuthEntry {
+    Value value;
+    int authority;  // -1 = absent, 0 = parent, 1 = leaf, 2 = SSD
+  };
+  std::map<Key, AuthEntry> merged;
+
+  std::set<CacheAttachment*> processed_parents;
+
+  for (Node* leaf : leaves) {
+    // ---- Parent cache (authority 0, highest) ----
+    if (leaf->parent && leaf->parent->height == 2) {
+      CacheAttachment* pc = leaf->parent->cache.get();
+      if (processed_parents.insert(pc).second) {
+        // Ensure sorted for consistent iteration
+        if (!pc->sorted_flag()) pc->sort_and_set_flag();
+        // Occupied entries
+        auto occ = pc->occupied_sorted();
+        for (const auto& [k, v] : occ) {
+          if (k >= lo && k <= hi) {
+            merged[k] = {v, 0};
+          }
+        }
+        // Absent entries suppress lower levels
+        auto abs = pc->absent_keys();
+        for (Key k : abs) {
+          if (k >= lo && k <= hi) {
+            merged[k] = {0, -1};
+          }
+        }
+      }
+    }
+
+    // ---- Leaf cache (authority 1) ----
+    CacheAttachment* lc = leaf->cache.get();
+    if (!lc->sorted_flag()) lc->sort_and_set_flag();
+    auto occ = lc->occupied_sorted();
+    for (const auto& [k, v] : occ) {
+      if (k >= lo && k <= hi) {
+        auto it = merged.find(k);
+        if (it == merged.end()) {
+          merged[k] = {v, 1};
+        }
+        // If parent cache has it (authority 0 or -1), keep parent's result
+      }
+    }
+    auto abs = lc->absent_keys();
+    for (Key k : abs) {
+      if (k >= lo && k <= hi) {
+        auto it = merged.find(k);
+        if (it == merged.end()) {
+          merged[k] = {0, -1};
+        }
+      }
+    }
+
+    // ---- SSD (authority 2, lowest) ----
+    std::vector<std::pair<Key, Value>> page_data;
+    ssd_->dump_sorted(leaf->page_id, &page_data);
+    for (const auto& [k, v] : page_data) {
+      if (k >= lo && k <= hi) {
+        auto it = merged.find(k);
+        if (it == merged.end()) {
+          merged[k] = {v, 2};
+        }
+      }
+    }
+  }
+
+  // 3. Build result: iterate sorted map, skip absent entries
+  std::vector<std::pair<Key, Value>> result;
+  for (const auto& [k, entry] : merged) {
+    if (entry.authority >= 0) {  // not absent
+      result.emplace_back(k, entry.value);
+    }
+  }
+
+  return result;
 }
 
 LookupResult Tree::get(Key k) {

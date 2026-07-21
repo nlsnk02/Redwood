@@ -324,4 +324,56 @@ std::vector<std::pair<Key, Value>> CacheAttachment::occupied_sorted() {
   return result;
 }
 
+void CacheAttachment::sort_and_set_flag() {
+  // Collect all Occupied and Absent entries with their metadata
+  struct SlotData {
+    Key key;
+    Value value;
+    SlotState state;
+    bool dirty;
+    Fingerprint fp;
+  };
+  std::vector<SlotData> entries;
+  for (int i = 0; i < kCacheSlots; ++i) {
+    SlotState st = slots_[i].state;
+    if (st == SlotState::Occupied || st == SlotState::Absent) {
+      entries.push_back({slots_[i].key, slots_[i].value, st, slots_[i].dirty,
+                         slots_[i].fp});
+    }
+  }
+
+  // Sort by key
+  std::sort(entries.begin(), entries.end(),
+            [](const SlotData& a, const SlotData& b) { return a.key < b.key; });
+
+  // Rearrange: sorted entries first, then empty slots
+  size_t pos = 0;
+  for (const auto& e : entries) {
+    slots_[pos].key = e.key;
+    slots_[pos].value = e.value;
+    slots_[pos].state = e.state;
+    slots_[pos].dirty = e.dirty;
+    slots_[pos].fp = e.fp;
+    slots_[pos].clock_bit.store(false, std::memory_order_release);
+    ++pos;
+  }
+  for (; pos < kCacheSlots; ++pos) {
+    slots_[pos].state = SlotState::Empty;
+    slots_[pos].clock_bit.store(false, std::memory_order_release);
+  }
+
+  set_sorted_flag(true);
+}
+
+std::vector<Key> CacheAttachment::absent_keys() const {
+  std::vector<Key> result;
+  for (int i = 0; i < kCacheSlots; ++i) {
+    if (slots_[i].state == SlotState::Absent) {
+      result.push_back(slots_[i].key);
+    }
+  }
+  std::sort(result.begin(), result.end());
+  return result;
+}
+
 }  // namespace cbtree

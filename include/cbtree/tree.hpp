@@ -22,6 +22,7 @@ class Tree {
 
   Status put(Key k, Value v);
   LookupResult get(Key k);
+  std::vector<std::pair<Key, Value>> scan(Key lo, Key hi);
 
   // Test hooks (progressively exposed in later tasks)
   void set_probabilities(double p_parent, double p_placeholder);
@@ -46,6 +47,8 @@ class Tree {
   void split_internal(Node* node);
   static void collect_leaves(const Node* node, std::vector<const Node*>& leaves);
   static void collect_leaves(Node* node, std::vector<Node*>& leaves);
+  static void collect_leaves_in_range(Node* node, Key lo, Key hi,
+                                      std::vector<Node*>& leaves);
 
   // Task 11: eviction helpers
   Node* find_leaf_for_key(Node* parent, Key k);

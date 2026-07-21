@@ -46,6 +46,10 @@ class CacheAttachment {
   std::vector<std::pair<Key, Value>> occupied_sorted();
   void flush_dirty(std::vector<std::pair<Key, Value>>& out);
 
+  // Task 12: range scan helpers
+  void sort_and_set_flag();
+  std::vector<Key> absent_keys() const;
+
   // Clear all slots (for debug, does not flush)
   void clear();
 
