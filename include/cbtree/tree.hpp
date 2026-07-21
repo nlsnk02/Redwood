@@ -40,6 +40,7 @@ class Tree {
   void split_leaf(Node* leaf);
   void split_internal(Node* node);
   static void collect_leaves(const Node* node, std::vector<const Node*>& leaves);
+  static void collect_leaves(Node* node, std::vector<Node*>& leaves);
 
   Node* root_;
   std::unique_ptr<SsDPageStore> ssd_;

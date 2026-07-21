@@ -14,8 +14,16 @@ Tree::Tree(const std::string& ssd_path)
   root_->page_id = ssd_->alloc_page();
 }
 
+static void delete_subtree(Node* node) {
+  if (!node) return;
+  for (Node* child : node->children) {
+    delete_subtree(child);
+  }
+  delete node;
+}
+
 Tree::~Tree() {
-  delete root_;
+  delete_subtree(root_);
   root_ = nullptr;
 }
 
@@ -259,12 +267,22 @@ void Tree::collect_leaves(const Node* node, std::vector<const Node*>& leaves) {
   }
 }
 
+void Tree::collect_leaves(Node* node, std::vector<Node*>& leaves) {
+  if (!node) return;
+  if (node->height == 1) {
+    leaves.push_back(node);
+    return;
+  }
+  for (Node* child : node->children) {
+    collect_leaves(child, leaves);
+  }
+}
+
 Status Tree::debug_flush_all() {
-  std::vector<const Node*> leaves;
+  std::vector<Node*> leaves;
   collect_leaves(root_, leaves);
 
-  for (const Node* leaf_const : leaves) {
-    Node* leaf = const_cast<Node*>(leaf_const);
+  for (Node* leaf : leaves) {
 
     // Write all dirty Occupied entries to SSD and register in leaf index
     std::vector<std::pair<Key, Value>> dirty_entries;
@@ -293,24 +311,25 @@ void Tree::split_leaf(Node* leaf) {
   // 1. Set version to odd (structural change in progress)
   leaf->version.fetch_add(1, std::memory_order_acq_rel);
 
-  // 2. Sort cache
-  (void)leaf->cache->occupied_sorted();
-  leaf->cache->set_sorted_flag(true);
-
-  // 3. Pick mid from leaf_keys
+  // 2. Pick mid from leaf_keys
   Key mid = leaf->leaf_keys[leaf->leaf_keys.size() / 2];
 
-  // 4. Allocate new page and split SSD data
+  // 3. Split SSD data (must succeed before we mutate tree structure)
   PageId new_right_id = 0;
-  ssd_->split_page(leaf->page_id, mid, &new_right_id);
+  Status split_s = ssd_->split_page(leaf->page_id, mid, &new_right_id);
+  if (split_s != Status::Ok) {
+    // Revert version and abort — disk failure leaves tree unchanged
+    leaf->version.fetch_add(1, std::memory_order_acq_rel);
+    return;
+  }
 
-  // 5. Create right leaf node
+  // 4. Create right leaf node
   Node* L_right = new Node{};
   L_right->height = 1;
   L_right->cache = std::make_unique<CacheAttachment>();
   L_right->page_id = new_right_id;
 
-  // 6. Split leaf index (leaf_keys, leaf_page_ids)
+  // 5. Split leaf index (leaf_keys, leaf_page_ids)
   std::vector<Key> left_keys;
   std::vector<PageId> left_pids;
   std::vector<Key> right_keys;
@@ -330,10 +349,10 @@ void Tree::split_leaf(Node* leaf) {
   L_right->leaf_keys = std::move(right_keys);
   L_right->leaf_page_ids = std::move(right_pids);
 
-  // 7. Split cache entries
+  // 6. Split cache entries
   leaf->cache->split_into(mid, L_right->cache.get());
 
-  // 8. Update parent
+  // 7. Update parent
   if (leaf == root_) {
     // Create new root
     Node* new_root = new Node{};
@@ -358,10 +377,10 @@ void Tree::split_leaf(Node* leaf) {
     L_right->parent = parent;
   }
 
-  // 9. Set version back to even (stable)
+  // 8. Set version back to even (stable)
   leaf->version.fetch_add(1, std::memory_order_acq_rel);
 
-  // 10. If parent overflows, recursively split
+  // 9. If parent overflows, recursively split
   if (leaf->parent && leaf->parent->children.size() > kInternalFanout) {
     split_internal(leaf->parent);
   }
