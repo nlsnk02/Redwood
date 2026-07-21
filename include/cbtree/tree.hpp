@@ -6,6 +6,7 @@
 #include "cbtree/types.hpp"
 #include "cbtree/node.hpp"
 #include "cbtree/ssd_page_store.hpp"
+#include "cbtree/adaptive_policy.hpp"
 
 namespace cbtree {
 
@@ -61,6 +62,7 @@ class Tree {
 
   Node* root_;
   std::unique_ptr<SsDPageStore> ssd_;
+  AdaptivePolicy adaptive_policy_;
   double p_parent_{kDefaultPParent};
   double p_placeholder_{kDefaultPPlaceholder};
 };
