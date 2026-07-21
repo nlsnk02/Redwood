@@ -51,3 +51,17 @@ TEST_F(TreeBasicTest, PutUpdatesExisting) {
 TEST_F(TreeBasicTest, InitialHeightIsOne) {
   EXPECT_EQ(tree_->debug_height(), 1);
 }
+
+// Exercise CLOCK eviction and SSD write/read path:
+// kCacheSlots = 16; inserting 20 keys forces eviction.
+TEST_F(TreeBasicTest, EvictDirtyToSSD) {
+  for (uint64_t i = 0; i < 20; ++i) {
+    ASSERT_EQ(tree_->put(i, i * 100), cbtree::Status::Ok);
+  }
+  // All 20 keys must be retrievable — some will have been evicted to SSD
+  for (uint64_t i = 0; i < 20; ++i) {
+    auto r = tree_->get(i);
+    ASSERT_EQ(r.status, cbtree::Status::Ok) << "key " << i;
+    EXPECT_EQ(r.value, i * 100) << "key " << i;
+  }
+}

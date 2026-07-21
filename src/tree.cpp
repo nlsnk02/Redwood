@@ -1,7 +1,6 @@
 // src/tree.cpp
 #include "cbtree/tree.hpp"
 #include "cbtree/cache_attachment.hpp"
-#include "cbtree/key_lock_table.hpp"
 
 namespace cbtree {
 
@@ -85,12 +84,12 @@ LookupResult Tree::get(Key k) {
     // Step 4: secondary cache check after SSD read
     LookupResult r2 = root_->cache->lookup(k);
     if (r2.status == Status::Ok) {
-      return r2;
+      r = r2;  // prefer cache hit, but still must validate version below
     }
 
-    // Step 5: version check after read
+    // Step 5: version check after read (applies to both SSD and post-SSD cache paths)
     if (root_->version.load(std::memory_order_acquire) == v) {
-      return r;  // version consistent, return SSD result
+      return r;
     }
     // Version changed -- retry
   }
