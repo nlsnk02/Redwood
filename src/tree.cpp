@@ -1,6 +1,7 @@
 // src/tree.cpp
 #include "cbtree/tree.hpp"
 #include "cbtree/cache_attachment.hpp"
+#include <algorithm>
 #include <random>
 
 namespace cbtree {
@@ -18,11 +19,84 @@ Tree::~Tree() {
   root_ = nullptr;
 }
 
-Status Tree::put(Key k, Value v) {
-  // Height-1 minimum version (single-threaded).
-  // upsert() internally acquires the per-key lock via KeyLockTable.
+Node* Tree::descend_to_leaf(Key k,
+                            std::vector<std::pair<Node*, uint64_t>>& versions) {
+  Node* cur = root_;
+  while (cur->height > 1) {
+    versions.emplace_back(cur, cur->version.load(std::memory_order_acquire));
+    // Binary search separators to determine child index
+    auto it = std::upper_bound(cur->separators.begin(), cur->separators.end(), k);
+    size_t idx = it - cur->separators.begin();
+    cur = cur->children[idx];
+  }
+  versions.emplace_back(cur, cur->version.load(std::memory_order_acquire));
+  return cur;  // leaf node
+}
 
-  Status s = root_->cache->upsert(k, v);
+Status Tree::put(Key k, Value v) {
+  thread_local std::mt19937_64 rng(std::random_device{}());
+
+  // ---- Phase 1: check parent (root) cache for existing key ----
+  // "沿途命中": if the key already exists in any upper cache, update it there.
+  if (root_->height >= 2) {
+    LookupResult lr = root_->cache->lookup(k);
+    bool exists_in_root =
+        (lr.status == Status::Ok) || root_->cache->has_absent(k);
+
+    if (exists_in_root) {
+      // Key already has a slot in root cache -- update it in place.
+      // upsert() will find the existing slot and update value/state.
+      Status s = root_->cache->upsert(k, v);
+      if (s == Status::Ok) return Status::Ok;
+      // If upsert failed (Full), evict a victim and retry.
+      if (s == Status::Full) {
+        Key victim_key = 0;
+        Value victim_val = 0;
+        bool victim_dirty = false;
+        root_->cache->pick_clock_victim(&victim_key, &victim_val, &victim_dirty);
+        root_->cache->upsert(k, v);
+        return Status::Ok;
+      }
+      return s;
+    }
+
+    // Key NOT in root cache.  Decide whether to insert here (P_parent).
+    bool use_parent = false;
+    if (p_parent_ >= 1.0) {
+      use_parent = true;
+    } else if (p_parent_ > 0.0) {
+      use_parent = std::bernoulli_distribution{p_parent_}(rng);
+    }
+
+    if (use_parent) {
+      // Try to insert into root cache.
+      Status s = root_->cache->upsert(k, v);
+      if (s == Status::Ok) return Status::Ok;
+
+      if (s == Status::Full) {
+        // Evict a victim from root cache (no SSD write -- root cache is
+        // purely in-memory).
+        Key victim_key = 0;
+        Value victim_val = 0;
+        bool victim_dirty = false;
+        Status evict_s = root_->cache->pick_clock_victim(&victim_key, &victim_val,
+                                                         &victim_dirty);
+        if (evict_s != Status::Ok) return Status::Full;
+        s = root_->cache->upsert(k, v);
+        if (s == Status::Ok) return Status::Ok;
+        return s;
+      }
+      return s;
+    }
+    // P_parent not selected -- fall through to leaf
+  }
+
+  // ---- Phase 2: descend to leaf ----
+  std::vector<std::pair<Node*, uint64_t>> versions;
+  Node* leaf = descend_to_leaf(k, versions);
+
+  // ---- Phase 3: leaf cache upsert ----
+  Status s = leaf->cache->upsert(k, v);
   if (s == Status::Ok) {
     // Do NOT update leaf_keys (lazy index -- populated during flush)
     return Status::Ok;
@@ -34,23 +108,22 @@ Status Tree::put(Key k, Value v) {
     Value victim_val = 0;
     bool victim_dirty = false;
 
-    Status evict_s = root_->cache->pick_clock_victim(&victim_key, &victim_val,
-                                                      &victim_dirty);
+    Status evict_s = leaf->cache->pick_clock_victim(&victim_key, &victim_val,
+                                                    &victim_dirty);
     if (evict_s != Status::Ok) {
       return Status::Full;  // nothing to evict (should not happen)
     }
 
-    // Write dirty victim to SSD (single-leaf, height=1)
+    // Write dirty victim to SSD
     if (victim_dirty) {
-      Status write_s = ssd_->put_record(root_->page_id, victim_key, victim_val);
+      Status write_s = ssd_->put_record(leaf->page_id, victim_key, victim_val);
       if (write_s != Status::Ok) {
         return Status::Error;
       }
     }
 
     // Retry upsert now that a slot is free
-    // Do NOT update leaf_keys (lazy index)
-    s = root_->cache->upsert(k, v);
+    s = leaf->cache->upsert(k, v);
     if (s == Status::Ok) {
       return Status::Ok;
     }
@@ -73,51 +146,59 @@ LookupResult Tree::get(Key k) {
       continue;   // spin/retry
     }
 
-    // Step 2: cache lookup (top-down, includes fingerprint pre-filter)
-    LookupResult r = root_->cache->lookup(k);
-    if (r.status == Status::Ok) {
-      return r;  // OCCUPIED hit -- return value
+    // Descend to leaf (record versions along the path)
+    std::vector<std::pair<Node*, uint64_t>> versions;
+    Node* leaf = descend_to_leaf(k, versions);
+
+    // Step 2: cache lookup -- top-down (parent cache first, then leaf cache)
+    if (root_->height >= 2) {
+      LookupResult pr = root_->cache->lookup(k);
+      if (pr.status == Status::Ok) {
+        return pr;  // OCCUPIED hit in parent cache
+      }
+      if (root_->cache->has_absent(k)) {
+        return {Status::NotFound};  // ABSENT hit in parent cache
+      }
     }
-    if (root_->cache->has_absent(k)) {
-      return {Status::NotFound};  // ABSENT hit -- return NotFound
+
+    LookupResult r = leaf->cache->lookup(k);
+    if (r.status == Status::Ok) {
+      return r;  // OCCUPIED hit in leaf cache
+    }
+    if (leaf->cache->has_absent(k)) {
+      return {Status::NotFound};  // ABSENT hit in leaf cache
     }
 
     // Step 3: cache miss -- try place placeholder with P_placeholder probability
-    // At most one placeholder per get (has_placed flag)
     bool has_placed = false;
     int placeholder_idx = -1;
     if (p_placeholder_ >= 1.0) {
-      // Deterministic: always place (test hook)
-      Status ps = root_->cache->try_place_placeholder(k, &placeholder_idx);
+      Status ps = leaf->cache->try_place_placeholder(k, &placeholder_idx);
       has_placed = (ps == Status::Ok);
     } else if (p_placeholder_ > 0.0) {
       if (std::bernoulli_distribution{p_placeholder_}(rng)) {
-        Status ps = root_->cache->try_place_placeholder(k, &placeholder_idx);
+        Status ps = leaf->cache->try_place_placeholder(k, &placeholder_idx);
         has_placed = (ps == Status::Ok);
       }
     }
 
-    // Step 4: query SSD
-    r = ssd_->get_record(root_->page_id, k);
+    // Step 4: query SSD (leaf's page)
+    r = ssd_->get_record(leaf->page_id, k);
 
-    // Step 5: post-SSD secondary cache recheck
-    LookupResult r2 = root_->cache->lookup(k);
+    // Step 5: post-SSD secondary cache recheck (leaf cache only)
+    LookupResult r2 = leaf->cache->lookup(k);
     if (r2.status == Status::Ok) {
-      // Cache hit after SSD read -- prefer cache
-      // If we placed a placeholder, fill it with the cached value
       if (has_placed) {
-        root_->cache->fill_placeholder(placeholder_idx, r2.value);
+        leaf->cache->fill_placeholder(placeholder_idx, r2.value);
       }
-      // Version check -- only return if stable
       if (root_->version.load(std::memory_order_acquire) == v) {
         return r2;
       }
       continue;  // version changed, retry
     }
-    if (root_->cache->has_absent(k)) {
-      // ABSENT entry found (concurrent get): cache authority over SSD
+    if (leaf->cache->has_absent(k)) {
       if (has_placed) {
-        root_->cache->fill_placeholder_absent(placeholder_idx);
+        leaf->cache->fill_placeholder_absent(placeholder_idx);
       }
       if (root_->version.load(std::memory_order_acquire) == v) {
         return {Status::NotFound};
@@ -126,17 +207,15 @@ LookupResult Tree::get(Key k) {
     }
 
     // Step 6: fill placeholder based on SSD result
-    // fill_placeholder / fill_placeholder_absent failures are benign:
-    // the version check + retry loop recovers if the slot was evicted/filled concurrently.
     if (has_placed) {
       if (r.status == Status::Ok) {
-        root_->cache->fill_placeholder(placeholder_idx, r.value);
+        leaf->cache->fill_placeholder(placeholder_idx, r.value);
       } else {
-        root_->cache->fill_placeholder_absent(placeholder_idx);
+        leaf->cache->fill_placeholder_absent(placeholder_idx);
       }
     }
 
-    // Step 7: version check after read (SSD or post-SSD cache paths)
+    // Step 7: version check after read
     if (root_->version.load(std::memory_order_acquire) == v) {
       return r;
     }
@@ -153,6 +232,48 @@ void Tree::set_probabilities(double p_parent, double p_placeholder) {
 
 int Tree::debug_height() const {
   return root_->height;
+}
+
+bool Tree::debug_parent_cache_contains(Key k) const {
+  if (root_->height < 2) return false;
+  // Check Occupied state via lookup
+  LookupResult r = root_->cache->lookup(k);
+  if (r.status == Status::Ok) return true;
+  // Check Absent state
+  return root_->cache->has_absent(k);
+}
+
+Tree Tree::DebugTwoLeaves(const std::string& ssd_path) {
+  Tree t(ssd_path);
+
+  // The constructor created a single-node tree (root at height=1).
+  // Delete that root and replace with a height=2 structure.
+  delete t.root_;
+
+  // Create two leaf nodes (height=1), each with its own cache and SSD page.
+  Node* leaf0 = new Node{};
+  leaf0->height = 1;
+  leaf0->cache = std::make_unique<CacheAttachment>();
+  leaf0->page_id = t.ssd_->alloc_page();
+
+  Node* leaf1 = new Node{};
+  leaf1->height = 1;
+  leaf1->cache = std::make_unique<CacheAttachment>();
+  leaf1->page_id = t.ssd_->alloc_page();
+
+  // Create root node (height=2) with cache and two children.
+  Node* root = new Node{};
+  root->height = 2;
+  root->cache = std::make_unique<CacheAttachment>();
+  root->separators.push_back(50);
+  root->children.push_back(leaf0);
+  root->children.push_back(leaf1);
+
+  leaf0->parent = root;
+  leaf1->parent = root;
+
+  t.root_ = root;
+  return t;
 }
 
 }  // namespace cbtree

@@ -65,3 +65,76 @@ TEST_F(TreeBasicTest, EvictDirtyToSSD) {
     EXPECT_EQ(r.value, i * 100) << "key " << i;
   }
 }
+
+// =============================================================================
+// Task 9: Multi-level tree with P_parent cache routing
+// =============================================================================
+
+TEST(TreeMultiLevel, DebugTwoLeaves) {
+  auto t = cbtree::Tree::DebugTwoLeaves("/tmp/test_ml.pages");
+  EXPECT_EQ(t.debug_height(), 2);
+  // Parent cache exists and is initially empty
+  EXPECT_FALSE(t.debug_parent_cache_contains(10));
+}
+
+TEST(TreeMultiLevel, PutToParentCache) {
+  auto t = cbtree::Tree::DebugTwoLeaves("/tmp/test_ml.pages");
+  t.set_probabilities(1.0, 0.0);  // always go to parent cache
+  ASSERT_EQ(t.put(10, 1), cbtree::Status::Ok);
+  EXPECT_TRUE(t.debug_parent_cache_contains(10));
+}
+
+TEST(TreeMultiLevel, PutToLeafCache) {
+  auto t = cbtree::Tree::DebugTwoLeaves("/tmp/test_ml.pages");
+  t.set_probabilities(0.0, 0.0);  // never go to parent cache
+  ASSERT_EQ(t.put(10, 1), cbtree::Status::Ok);
+  // Parent cache should NOT have the key
+  EXPECT_FALSE(t.debug_parent_cache_contains(10));
+}
+
+TEST(TreeMultiLevel, DescendFindsCorrectLeaf) {
+  auto t = cbtree::Tree::DebugTwoLeaves("/tmp/test_ml.pages");
+  t.set_probabilities(0.0, 0.0);
+  // Keys should route to correct leaf based on separator
+  ASSERT_EQ(t.put(5, 50), cbtree::Status::Ok);
+  ASSERT_EQ(t.put(50, 500), cbtree::Status::Ok);
+  EXPECT_EQ(t.get(5).value, 50u);
+  EXPECT_EQ(t.get(50).value, 500u);
+}
+
+TEST(TreeMultiLevel, GetChecksParentCache) {
+  auto t = cbtree::Tree::DebugTwoLeaves("/tmp/test_ml.pages");
+  t.set_probabilities(1.0, 0.0);  // put into parent cache
+  ASSERT_EQ(t.put(42, 420), cbtree::Status::Ok);
+  // get should find it in parent cache
+  auto r = t.get(42);
+  EXPECT_EQ(r.status, cbtree::Status::Ok);
+  EXPECT_EQ(r.value, 420u);
+}
+
+TEST(TreeMultiLevel, GetFromLeafCache) {
+  auto t = cbtree::Tree::DebugTwoLeaves("/tmp/test_ml.pages");
+  t.set_probabilities(0.0, 0.0);  // put into leaf cache
+  ASSERT_EQ(t.put(7, 77), cbtree::Status::Ok);
+  // Not in parent cache
+  EXPECT_FALSE(t.debug_parent_cache_contains(7));
+  // Still findable via leaf
+  auto r = t.get(7);
+  EXPECT_EQ(r.status, cbtree::Status::Ok);
+  EXPECT_EQ(r.value, 77u);
+}
+
+TEST(TreeMultiLevel, GetNotFoundMultiLevel) {
+  auto t = cbtree::Tree::DebugTwoLeaves("/tmp/test_ml.pages");
+  auto r = t.get(999);
+  EXPECT_EQ(r.status, cbtree::Status::NotFound);
+}
+
+TEST(TreeMultiLevel, DegenerateHeight1StillWorks) {
+  auto t = cbtree::Tree("/tmp/test_ml_deg.pages");
+  EXPECT_EQ(t.debug_height(), 1);
+  ASSERT_EQ(t.put(1, 10), cbtree::Status::Ok);
+  auto r = t.get(1);
+  EXPECT_EQ(r.status, cbtree::Status::Ok);
+  EXPECT_EQ(r.value, 10u);
+}
