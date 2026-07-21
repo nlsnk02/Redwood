@@ -110,7 +110,8 @@ Status Tree::put(Key k, Value v) {
 
   // ---- Phase 1: check parent (root) cache for existing key ----
   // "沿途命中": if the key already exists in any upper cache, update it there.
-  if (root_->height >= 2) {
+  // Only height <= 2 nodes have caches.
+  if (root_->height >= 2 && root_->cache) {
     LookupResult lr = root_->cache->lookup(k);
     bool exists_in_root =
         (lr.status == Status::Ok) || root_->cache->has_absent(k);
@@ -277,7 +278,7 @@ std::vector<std::pair<Key, Value>> Tree::scan(Key lo, Key hi) {
 
   for (Node* leaf : leaves) {
     // ---- Parent cache (authority 0, highest) ----
-    if (leaf->parent && leaf->parent->height == 2) {
+    if (leaf->parent && leaf->parent->height == 2 && leaf->parent->cache) {
       CacheAttachment* pc = leaf->parent->cache.get();
       if (processed_parents.insert(pc).second) {
         // Ensure sorted for consistent iteration
@@ -365,7 +366,8 @@ LookupResult Tree::get(Key k) {
     uint64_t leaf_v = versions.back().second;  // leaf version snapshot
 
     // Step 2: cache lookup -- top-down (parent cache first, then leaf cache)
-    if (root_->height >= 2) {
+    // Only height <= 2 nodes have caches.
+    if (root_->height >= 2 && root_->cache) {
       LookupResult pr = root_->cache->lookup(k);
       if (pr.status == Status::Ok) {
         return pr;  // OCCUPIED hit in parent cache
@@ -450,7 +452,7 @@ int Tree::debug_height() const {
 }
 
 bool Tree::debug_parent_cache_contains(Key k) const {
-  if (root_->height < 2) return false;
+  if (root_->height < 2 || !root_->cache) return false;
   // Check Occupied state via lookup
   LookupResult r = root_->cache->lookup(k);
   if (r.status == Status::Ok) return true;
@@ -596,12 +598,39 @@ void Tree::split_internal(Node* node) {
   size_t mid_idx = node->separators.size() / 2;
   Key mid = node->separators[mid_idx];
 
-  // 3. Create new right internal node
+  // 3. Cache handling for height >= 3: push down to children if present (safety net)
+  if (node->height >= 3 && node->cache) {
+    // Push occupied entries down to children's caches
+    if (!node->cache->sorted_flag()) node->cache->sort_and_set_flag();
+    auto occ = node->cache->occupied_sorted();
+    for (const auto& [k, v] : occ) {
+      auto it = std::upper_bound(node->separators.begin(), node->separators.end(), k);
+      size_t child_idx = static_cast<size_t>(it - node->separators.begin());
+      Node* child = node->children[child_idx];
+      if (child->cache) {
+        child->cache->upsert(k, v);
+      }
+    }
+    // Push absent entries down to children's caches
+    auto abs = node->cache->absent_keys();
+    for (Key k : abs) {
+      auto it = std::upper_bound(node->separators.begin(), node->separators.end(), k);
+      size_t child_idx = static_cast<size_t>(it - node->separators.begin());
+      Node* child = node->children[child_idx];
+      if (child->cache) {
+        child->cache->mark_absent(k);
+      }
+    }
+    node->cache = nullptr;
+  }
+
+  // 4. Create new right internal node
   Node* new_node = new Node{};
   new_node->height = node->height;
   if (new_node->height == 2) {
     new_node->cache = std::make_unique<CacheAttachment>();
   }
+  // height >= 3: new_node->cache stays nullptr (default unique_ptr)
 
   // Move separator and children >= mid to new node
   // Number of children = number of separators + 1
@@ -620,11 +649,19 @@ void Tree::split_internal(Node* node) {
   node->separators.resize(mid_idx);
   node->children.resize(mid_idx + 1);
 
-  // 4. Update parent
+  // 5. Split cache for height == 2 (both keep cache, distribute entries by mid)
+  if (node->height == 2) {
+    node->cache->split_into(mid, new_node->cache.get());
+  }
+
+  // 6. Update parent
   if (node == root_) {
     Node* new_root = new Node{};
     new_root->height = node->height + 1;
-    new_root->cache = std::make_unique<CacheAttachment>();
+    // Only height 1 and 2 nodes have caches
+    if (new_root->height < 3) {
+      new_root->cache = std::make_unique<CacheAttachment>();
+    }
     new_root->separators.push_back(mid);
     new_root->children.push_back(node);
     new_root->children.push_back(new_node);
@@ -643,10 +680,10 @@ void Tree::split_internal(Node* node) {
     new_node->parent = parent;
   }
 
-  // 5. Set version back to even
+  // 7. Set version back to even
   node->version.fetch_add(1, std::memory_order_acq_rel);
 
-  // 6. Recursively split parent if overflow
+  // 8. Recursively split parent if overflow
   if (node->parent && node->parent->children.size() > kInternalFanout) {
     split_internal(node->parent);
   }
@@ -663,6 +700,21 @@ bool Tree::debug_all_leaves_have_cache() const {
 
 bool Tree::debug_root_has_cache() const {
   return root_->cache != nullptr;
+}
+
+bool Tree::debug_height3_nodes_have_no_cache() const {
+  std::vector<const Node*> stack;
+  stack.push_back(root_);
+  while (!stack.empty()) {
+    const Node* node = stack.back();
+    stack.pop_back();
+    if (!node) continue;
+    if (node->height >= 3 && node->cache) return false;
+    for (Node* child : node->children) {
+      stack.push_back(child);
+    }
+  }
+  return true;
 }
 
 void Tree::debug_clear_all_caches() {

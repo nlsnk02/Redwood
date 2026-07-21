@@ -40,6 +40,9 @@ class Tree {
   // Debug factory: creates a height=2 tree with two leaf children
   static Tree DebugTwoLeaves(const std::string& ssd_path);
 
+  // Debug: verify height >= 3 nodes have no cache
+  bool debug_height3_nodes_have_no_cache() const;
+
  private:
   Node* descend_to_leaf(Key k,
                         std::vector<std::pair<Node*, uint64_t>>& versions);

@@ -45,3 +45,20 @@ TEST_F(TreeSplitTest, SplitPreservesCache) {
     EXPECT_TRUE(tree_->debug_root_has_cache());
   }
 }
+
+TEST_F(TreeSplitTest, InternalSplitReachesHeight3) {
+  // Insert enough keys to force multi-level split past height 2
+  for (uint64_t i = 0; i < cbtree::kLeafFanout * cbtree::kInternalFanout + 1; ++i) {
+    ASSERT_EQ(tree_->put(i, i), cbtree::Status::Ok);
+    ASSERT_EQ(tree_->debug_flush_all(), cbtree::Status::Ok);
+  }
+  EXPECT_GE(tree_->debug_height(), 3);
+  // All nodes with height >= 3 must have no cache
+  EXPECT_TRUE(tree_->debug_height3_nodes_have_no_cache());
+  // All keys still readable
+  for (uint64_t i = 0; i < 20; ++i) {
+    auto r = tree_->get(i);
+    ASSERT_EQ(r.status, cbtree::Status::Ok);
+    EXPECT_EQ(r.value, i);
+  }
+}
