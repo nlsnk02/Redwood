@@ -27,6 +27,9 @@ class Tree {
   void set_probabilities(double p_parent, double p_placeholder);
   int debug_height() const;
   bool debug_parent_cache_contains(Key k) const;
+  Status debug_flush_all();
+  bool debug_all_leaves_have_cache() const;
+  bool debug_root_has_cache() const;
 
   // Debug factory: creates a height=2 tree with two leaf children
   static Tree DebugTwoLeaves(const std::string& ssd_path);
@@ -34,6 +37,9 @@ class Tree {
  private:
   Node* descend_to_leaf(Key k,
                         std::vector<std::pair<Node*, uint64_t>>& versions);
+  void split_leaf(Node* leaf);
+  void split_internal(Node* node);
+  static void collect_leaves(const Node* node, std::vector<const Node*>& leaves);
 
   Node* root_;
   std::unique_ptr<SsDPageStore> ssd_;

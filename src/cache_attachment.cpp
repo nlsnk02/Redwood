@@ -296,6 +296,15 @@ Status CacheAttachment::split_into(Key mid, CacheAttachment* right) {
   return Status::Ok;
 }
 
+void CacheAttachment::flush_dirty(std::vector<std::pair<Key, Value>>& out) {
+  for (int i = 0; i < kCacheSlots; ++i) {
+    if (slots_[i].state == SlotState::Occupied && slots_[i].dirty) {
+      out.emplace_back(slots_[i].key, slots_[i].value);
+      slots_[i].dirty = false;
+    }
+  }
+}
+
 std::vector<std::pair<Key, Value>> CacheAttachment::occupied_sorted() {
   std::vector<std::pair<Key, Value>> result;
   for (int i = 0; i < kCacheSlots; ++i) {

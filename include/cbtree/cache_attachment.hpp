@@ -44,6 +44,7 @@ class CacheAttachment {
   Status pick_clock_victim(Key* out_key, Value* out_val, bool* out_dirty);
   Status split_into(Key mid, CacheAttachment* right);
   std::vector<std::pair<Key, Value>> occupied_sorted();
+  void flush_dirty(std::vector<std::pair<Key, Value>>& out);
 
   KeyLockTable& key_locks() { return key_locks_; }
 
