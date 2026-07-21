@@ -60,7 +60,7 @@ void Tree::register_in_leaf_index(Node* leaf, Key k) {
 }
 
 Status Tree::evict_leaf_if_needed(Node* leaf) {
-  if (leaf->cache->occupied_count() <
+  if (leaf->cache->occupied_count() <=
       static_cast<int>(kCacheSlots * kLeafFillThreshold))
     return Status::Ok;
   Key victim_key = 0;
@@ -81,7 +81,7 @@ Status Tree::evict_leaf_if_needed(Node* leaf) {
 }
 
 Status Tree::evict_parent_if_needed(Node* parent) {
-  if (parent->cache->occupied_count() <
+  if (parent->cache->occupied_count() <=
       static_cast<int>(kCacheSlots * kParentFillThreshold))
     return Status::Ok;
   Key victim_key = 0;
@@ -129,6 +129,12 @@ Status Tree::put(Key k, Value v) {
         Status evict_s = root_->cache->pick_clock_victim(&victim_key, &victim_val,
                                                          &victim_dirty);
         if (evict_s != Status::Ok) return Status::Full;
+        // Demote dirty victim to leaf (must not discard data)
+        if (victim_dirty) {
+          Node* leaf = find_leaf_for_key(root_, victim_key);
+          evict_leaf_if_needed(leaf);
+          leaf->cache->upsert(victim_key, victim_val);
+        }
         s = root_->cache->upsert(k, v);
         if (s == Status::Ok) {
           evict_parent_if_needed(root_);
@@ -156,14 +162,18 @@ Status Tree::put(Key k, Value v) {
       }
 
       if (s == Status::Full) {
-        // Evict a victim from root cache (no SSD write -- root cache is
-        // purely in-memory).
+        // Evict a victim from root cache and demote dirty data to leaf.
         Key victim_key = 0;
         Value victim_val = 0;
         bool victim_dirty = false;
         Status evict_s = root_->cache->pick_clock_victim(&victim_key, &victim_val,
                                                          &victim_dirty);
         if (evict_s != Status::Ok) return Status::Full;
+        if (victim_dirty) {
+          Node* leaf = find_leaf_for_key(root_, victim_key);
+          evict_leaf_if_needed(leaf);
+          leaf->cache->upsert(victim_key, victim_val);
+        }
         s = root_->cache->upsert(k, v);
         if (s == Status::Ok) {
           evict_parent_if_needed(root_);
@@ -206,6 +216,8 @@ Status Tree::put(Key k, Value v) {
       if (write_s != Status::Ok) {
         return Status::Error;
       }
+      // Lazy index registration (same as evict_leaf_if_needed path)
+      register_in_leaf_index(leaf, victim_key);
     }
 
     // Retry upsert now that a slot is free
