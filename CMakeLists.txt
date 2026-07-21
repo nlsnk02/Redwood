@@ -34,6 +34,7 @@ add_executable(cbtree_tests
   tests/test_tree_basic.cpp
   tests/test_tree_placeholder.cpp
   tests/test_tree_split.cpp
+  tests/test_tree_evict.cpp
 )
 target_link_libraries(cbtree_tests PRIVATE cbtree GTest::gtest_main)
 include(GoogleTest)

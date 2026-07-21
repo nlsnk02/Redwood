@@ -305,6 +305,14 @@ void CacheAttachment::flush_dirty(std::vector<std::pair<Key, Value>>& out) {
   }
 }
 
+void CacheAttachment::clear() {
+  for (int i = 0; i < kCacheSlots; ++i) {
+    std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
+    slots_[i].state = SlotState::Empty;
+    slots_[i].clock_bit.store(false, std::memory_order_release);
+  }
+}
+
 std::vector<std::pair<Key, Value>> CacheAttachment::occupied_sorted() {
   std::vector<std::pair<Key, Value>> result;
   for (int i = 0; i < kCacheSlots; ++i) {

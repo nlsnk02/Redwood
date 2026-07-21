@@ -31,6 +31,11 @@ class Tree {
   bool debug_all_leaves_have_cache() const;
   bool debug_root_has_cache() const;
 
+  // Debug: eviction hooks (Task 11)
+  void debug_clear_all_caches();
+  bool debug_leaf_index_empty() const;
+  bool debug_some_keys_in_leaf_cache() const;
+
   // Debug factory: creates a height=2 tree with two leaf children
   static Tree DebugTwoLeaves(const std::string& ssd_path);
 
@@ -41,6 +46,12 @@ class Tree {
   void split_internal(Node* node);
   static void collect_leaves(const Node* node, std::vector<const Node*>& leaves);
   static void collect_leaves(Node* node, std::vector<Node*>& leaves);
+
+  // Task 11: eviction helpers
+  Node* find_leaf_for_key(Node* parent, Key k);
+  void register_in_leaf_index(Node* leaf, Key k);
+  Status evict_leaf_if_needed(Node* leaf);
+  Status evict_parent_if_needed(Node* parent);
 
   Node* root_;
   std::unique_ptr<SsDPageStore> ssd_;

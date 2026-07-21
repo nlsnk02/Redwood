@@ -46,6 +46,9 @@ class CacheAttachment {
   std::vector<std::pair<Key, Value>> occupied_sorted();
   void flush_dirty(std::vector<std::pair<Key, Value>>& out);
 
+  // Clear all slots (for debug, does not flush)
+  void clear();
+
   KeyLockTable& key_locks() { return key_locks_; }
 
  private:
