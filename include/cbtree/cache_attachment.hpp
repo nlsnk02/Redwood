@@ -45,6 +45,8 @@ class CacheAttachment {
   Status split_into(Key mid, CacheAttachment* right);
   std::vector<std::pair<Key, Value>> occupied_sorted();
 
+  KeyLockTable& key_locks() { return key_locks_; }
+
  private:
   CacheSlot slots_[kCacheSlots];
   std::atomic<size_t> hand_{0};

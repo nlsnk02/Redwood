@@ -31,6 +31,7 @@ add_executable(cbtree_tests
   tests/test_key_lock_table.cpp
   tests/test_cache_attachment.cpp
   tests/test_ssd_page_store.cpp
+  tests/test_tree_basic.cpp
 )
 target_link_libraries(cbtree_tests PRIVATE cbtree GTest::gtest_main)
 include(GoogleTest)
