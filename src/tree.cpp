@@ -54,6 +54,7 @@ Node* Tree::find_leaf_for_key(Node* parent, Key k) {
 }
 
 void Tree::register_in_leaf_index(Node* leaf, Key k) {
+  std::lock_guard<std::mutex> lock(leaf->leaf_index_mutex);
   auto it = std::lower_bound(leaf->leaf_keys.begin(), leaf->leaf_keys.end(), k);
   if (it != leaf->leaf_keys.end() && *it == k) return;  // already exists
   size_t idx = it - leaf->leaf_keys.begin();
@@ -68,17 +69,19 @@ Status Tree::evict_leaf_if_needed(Node* leaf) {
   Key victim_key = 0;
   Value victim_val = 0;
   bool victim_dirty = false;
-  if (leaf->cache->pick_clock_victim(&victim_key, &victim_val, &victim_dirty)
-      != Status::Ok)
+  int victim_idx = -1;
+  if (leaf->cache->find_clock_victim(&victim_key, &victim_val, &victim_dirty,
+                                     &victim_idx) != Status::Ok)
     return Status::Ok;
 
   if (victim_dirty) {
-    // Write to SSD
-    ssd_->put_record(leaf->page_id, victim_key, victim_val);
-    // Lazy index registration: register key here during flush
+    // Write to SSD BEFORE clearing the slot (prevents get() from missing)
+    Status write_s = ssd_->put_record(leaf->page_id, victim_key, victim_val);
+    if (write_s != Status::Ok) return Status::Ok;  // leave slot intact on failure
     register_in_leaf_index(leaf, victim_key);
   }
-  // Clean Occupied / Absent: already discarded by CLOCK (slot set to Empty)
+  // Now clear the slot (verified against victim_key)
+  leaf->cache->evict_slot(victim_idx, victim_key);
   return Status::Ok;
 }
 
@@ -89,8 +92,9 @@ Status Tree::evict_parent_if_needed(Node* parent) {
   Key victim_key = 0;
   Value victim_val = 0;
   bool victim_dirty = false;
-  if (parent->cache->pick_clock_victim(&victim_key, &victim_val, &victim_dirty)
-      != Status::Ok)
+  int victim_idx = -1;
+  if (parent->cache->find_clock_victim(&victim_key, &victim_val, &victim_dirty,
+                                       &victim_idx) != Status::Ok)
     return Status::Ok;
 
   if (victim_dirty) {
@@ -101,7 +105,8 @@ Status Tree::evict_parent_if_needed(Node* parent) {
     // Insert into leaf cache
     leaf->cache->upsert(victim_key, victim_val);
   }
-  // Clean Occupied / Absent: already discarded by CLOCK
+  // Now clear the slot (verified against victim_key)
+  parent->cache->evict_slot(victim_idx, victim_key);
   return Status::Ok;
 }
 
@@ -119,33 +124,33 @@ Status Tree::put(Key k, Value v) {
     if (exists_in_root) {
       // Key already has a slot in root cache -- update it in place.
       // upsert() will find the existing slot and update value/state.
-      Status s = root_->cache->upsert(k, v);
-      if (s == Status::Ok) {
-        evict_parent_if_needed(root_);
-        return Status::Ok;
-      }
-      // If upsert failed (Full), evict a victim and retry.
-      if (s == Status::Full) {
+      constexpr int kMaxParentRetries = 64;
+      for (int retry = 0; retry < kMaxParentRetries; ++retry) {
+        Status s = root_->cache->upsert(k, v);
+        if (s == Status::Ok) {
+          evict_parent_if_needed(root_);
+          return Status::Ok;
+        }
+
+        if (s != Status::Full) return s;
+
+        // Evict a victim and retry
         Key victim_key = 0;
         Value victim_val = 0;
         bool victim_dirty = false;
-        Status evict_s = root_->cache->pick_clock_victim(&victim_key, &victim_val,
-                                                         &victim_dirty);
+        int victim_idx = -1;
+        Status evict_s = root_->cache->find_clock_victim(&victim_key, &victim_val,
+                                                         &victim_dirty, &victim_idx);
         if (evict_s != Status::Ok) return Status::Full;
-        // Demote dirty victim to leaf (must not discard data)
         if (victim_dirty) {
           Node* leaf = find_leaf_for_key(root_, victim_key);
           evict_leaf_if_needed(leaf);
           leaf->cache->upsert(victim_key, victim_val);
         }
-        s = root_->cache->upsert(k, v);
-        if (s == Status::Ok) {
-          evict_parent_if_needed(root_);
-          return Status::Ok;
-        }
-        return s;
+        root_->cache->evict_slot(victim_idx, victim_key);
+        // Loop back to retry upsert
       }
-      return s;
+      return Status::Full;
     }
 
     // Key NOT in root cache.  Decide whether to insert here (P_parent).
@@ -157,34 +162,34 @@ Status Tree::put(Key k, Value v) {
     }
 
     if (use_parent) {
-      // Try to insert into root cache.
-      Status s = root_->cache->upsert(k, v);
-      if (s == Status::Ok) {
-        evict_parent_if_needed(root_);
-        return Status::Ok;
-      }
+      // Try to insert into root cache (retry on Full).
+      constexpr int kMaxParentRetries = 64;
+      for (int retry = 0; retry < kMaxParentRetries; ++retry) {
+        Status s = root_->cache->upsert(k, v);
+        if (s == Status::Ok) {
+          evict_parent_if_needed(root_);
+          return Status::Ok;
+        }
 
-      if (s == Status::Full) {
+        if (s != Status::Full) return s;
+
         // Evict a victim from root cache and demote dirty data to leaf.
         Key victim_key = 0;
         Value victim_val = 0;
         bool victim_dirty = false;
-        Status evict_s = root_->cache->pick_clock_victim(&victim_key, &victim_val,
-                                                         &victim_dirty);
+        int victim_idx = -1;
+        Status evict_s = root_->cache->find_clock_victim(&victim_key, &victim_val,
+                                                         &victim_dirty, &victim_idx);
         if (evict_s != Status::Ok) return Status::Full;
         if (victim_dirty) {
           Node* leaf = find_leaf_for_key(root_, victim_key);
           evict_leaf_if_needed(leaf);
           leaf->cache->upsert(victim_key, victim_val);
         }
-        s = root_->cache->upsert(k, v);
-        if (s == Status::Ok) {
-          evict_parent_if_needed(root_);
-          return Status::Ok;
-        }
-        return s;
+        root_->cache->evict_slot(victim_idx, victim_key);
+        // Loop back to retry upsert
       }
-      return s;
+      return Status::Full;
     }
     // P_parent not selected -- fall through to leaf
   }
@@ -193,46 +198,42 @@ Status Tree::put(Key k, Value v) {
   std::vector<std::pair<Node*, uint64_t>> versions;
   Node* leaf = descend_to_leaf(k, versions);
 
-  // ---- Phase 3: leaf cache upsert ----
-  Status s = leaf->cache->upsert(k, v);
-  if (s == Status::Ok) {
-    // Do NOT update leaf_keys (lazy index -- populated during flush)
-    evict_leaf_if_needed(leaf);
-    return Status::Ok;
-  }
+  // ---- Phase 3: leaf cache upsert (retry on Full) ----
+  constexpr int kMaxUpsertRetries = 64;
+  for (int retry = 0; retry < kMaxUpsertRetries; ++retry) {
+    Status s = leaf->cache->upsert(k, v);
+    if (s == Status::Ok) {
+      evict_leaf_if_needed(leaf);
+      return Status::Ok;
+    }
 
-  // Cache is full -- evict one slot via CLOCK and retry
-  if (s == Status::Full) {
+    if (s != Status::Full) return s;
+
+    // Cache is full -- evict one slot via CLOCK and retry
     Key victim_key = 0;
     Value victim_val = 0;
     bool victim_dirty = false;
+    int victim_idx = -1;
 
-    Status evict_s = leaf->cache->pick_clock_victim(&victim_key, &victim_val,
-                                                    &victim_dirty);
+    Status evict_s = leaf->cache->find_clock_victim(&victim_key, &victim_val,
+                                                    &victim_dirty, &victim_idx);
     if (evict_s != Status::Ok) {
       return Status::Full;  // nothing to evict (should not happen)
     }
 
-    // Write dirty victim to SSD
+    // Write dirty victim to SSD BEFORE clearing the slot
     if (victim_dirty) {
       Status write_s = ssd_->put_record(leaf->page_id, victim_key, victim_val);
       if (write_s != Status::Ok) {
         return Status::Error;
       }
-      // Lazy index registration (same as evict_leaf_if_needed path)
       register_in_leaf_index(leaf, victim_key);
     }
-
-    // Retry upsert now that a slot is free
-    s = leaf->cache->upsert(k, v);
-    if (s == Status::Ok) {
-      evict_leaf_if_needed(leaf);
-      return Status::Ok;
-    }
-    return s;
+    // Now clear the slot (verified against victim_key)
+    leaf->cache->evict_slot(victim_idx, victim_key);
+    // Loop back to retry upsert
   }
-
-  return s;
+  return Status::Full;
 }
 
 void Tree::collect_leaves_in_range(Node* node, Key lo, Key hi,
@@ -487,6 +488,7 @@ Status Tree::debug_flush_all() {
   collect_leaves(root_, leaves);
 
   for (Node* leaf : leaves) {
+    std::lock_guard<std::mutex> lock(leaf->leaf_index_mutex);
 
     // Write all dirty Occupied entries to SSD and register in leaf index
     std::vector<std::pair<Key, Value>> dirty_entries;

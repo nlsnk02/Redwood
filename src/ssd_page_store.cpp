@@ -55,6 +55,7 @@ SsDPageStore::~SsDPageStore() {
 }
 
 PageId SsDPageStore::alloc_page() {
+  // Called from split_page (which holds mutex_) or during single-threaded init
   off_t end = lseek(fd_, 0, SEEK_END);
   if (end < 0) return 0;
   // Extend file by one page
@@ -81,6 +82,7 @@ Status SsDPageStore::read_page(PageId id, std::array<std::byte, kPageSize>& buf)
 }
 
 Status SsDPageStore::put_record(PageId id, Key key, Value value) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   std::array<std::byte, kPageSize> page{};
   Status s = read_page(id, page);
   if (s != Status::Ok) return s;
@@ -110,6 +112,7 @@ Status SsDPageStore::put_record(PageId id, Key key, Value value) {
 }
 
 LookupResult SsDPageStore::get_record(PageId id, Key key) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   std::array<std::byte, kPageSize> page{};
   Status s = read_page(id, page);
   if (s != Status::Ok) return {s, 0};
@@ -125,6 +128,7 @@ LookupResult SsDPageStore::get_record(PageId id, Key key) {
 }
 
 Status SsDPageStore::dump_sorted(PageId id, std::vector<std::pair<Key, Value>>* out) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   std::array<std::byte, kPageSize> page{};
   Status s = read_page(id, page);
   if (s != Status::Ok) return s;
@@ -143,6 +147,7 @@ Status SsDPageStore::dump_sorted(PageId id, std::vector<std::pair<Key, Value>>* 
 }
 
 Status SsDPageStore::split_page(PageId left_id, Key mid, PageId* new_right_id) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   // Read left page
   std::array<std::byte, kPageSize> left_page{};
   Status s = read_page(left_id, left_page);

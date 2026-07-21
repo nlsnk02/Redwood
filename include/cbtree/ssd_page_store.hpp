@@ -2,6 +2,7 @@
 #include <array>
 #include <cstdint>
 #include <cstddef>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <utility>
@@ -36,6 +37,7 @@ class SsDPageStore {
 
  private:
   int fd_;
+  mutable std::recursive_mutex mutex_;
 };
 
 }  // namespace cbtree

@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 #include "cbtree/types.hpp"
 #include "cbtree/cache_attachment.hpp"
@@ -17,6 +18,7 @@ struct Node {
   std::vector<Key> leaf_keys;         // ordered key list (populated only during flush)
   std::vector<PageId> leaf_page_ids;  // page id for each leaf_keys[i]
   PageId page_id{0};                  // SSD page for this leaf
+  mutable std::mutex leaf_index_mutex; // protects leaf_keys / leaf_page_ids
 
   // Internal node fields (valid when height >= 2)
   std::vector<Key> separators;        // separator keys

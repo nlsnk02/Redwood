@@ -36,6 +36,7 @@ add_executable(cbtree_tests
   tests/test_tree_split.cpp
   tests/test_tree_evict.cpp
   tests/test_tree_range.cpp
+  tests/test_tree_concurrent.cpp
 )
 target_link_libraries(cbtree_tests PRIVATE cbtree GTest::gtest_main)
 include(GoogleTest)

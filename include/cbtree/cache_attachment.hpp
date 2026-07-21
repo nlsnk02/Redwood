@@ -16,7 +16,7 @@ struct CacheSlot {
   Fingerprint fp{};
   bool dirty{false};
   std::atomic<bool> clock_bit{false};
-  std::mutex slot_mutex;
+  mutable std::mutex slot_mutex;
 };
 
 class CacheAttachment {
@@ -42,6 +42,12 @@ class CacheAttachment {
 
   // Future tasks: declared only, not implemented in Task 4
   Status pick_clock_victim(Key* out_key, Value* out_val, bool* out_dirty);
+  // Two-phase eviction: find victim without clearing, then evict after SSD write
+  Status find_clock_victim(Key* out_key, Value* out_val, bool* out_dirty,
+                           int* out_idx);
+  // Verify key matches before clearing (prevents clearing a slot that was
+  // repurposed by another thread after find_clock_victim).
+  void evict_slot(int idx, Key expected_key);
   Status split_into(Key mid, CacheAttachment* right);
   std::vector<std::pair<Key, Value>> occupied_sorted();
   void flush_dirty(std::vector<std::pair<Key, Value>>& out);
