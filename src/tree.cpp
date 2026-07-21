@@ -53,9 +53,12 @@ Status Tree::put(Key k, Value v) {
         Key victim_key = 0;
         Value victim_val = 0;
         bool victim_dirty = false;
-        root_->cache->pick_clock_victim(&victim_key, &victim_val, &victim_dirty);
-        root_->cache->upsert(k, v);
-        return Status::Ok;
+        Status evict_s = root_->cache->pick_clock_victim(&victim_key, &victim_val,
+                                                         &victim_dirty);
+        if (evict_s != Status::Ok) return Status::Full;
+        s = root_->cache->upsert(k, v);
+        if (s == Status::Ok) return Status::Ok;
+        return s;
       }
       return s;
     }
@@ -149,6 +152,7 @@ LookupResult Tree::get(Key k) {
     // Descend to leaf (record versions along the path)
     std::vector<std::pair<Node*, uint64_t>> versions;
     Node* leaf = descend_to_leaf(k, versions);
+    uint64_t leaf_v = versions.back().second;  // leaf version snapshot
 
     // Step 2: cache lookup -- top-down (parent cache first, then leaf cache)
     if (root_->height >= 2) {
@@ -191,7 +195,8 @@ LookupResult Tree::get(Key k) {
       if (has_placed) {
         leaf->cache->fill_placeholder(placeholder_idx, r2.value);
       }
-      if (root_->version.load(std::memory_order_acquire) == v) {
+      // Verify leaf version is stable (root version check at step 1 covers structural changes)
+      if (leaf->version.load(std::memory_order_acquire) == leaf_v) {
         return r2;
       }
       continue;  // version changed, retry
@@ -200,7 +205,7 @@ LookupResult Tree::get(Key k) {
       if (has_placed) {
         leaf->cache->fill_placeholder_absent(placeholder_idx);
       }
-      if (root_->version.load(std::memory_order_acquire) == v) {
+      if (leaf->version.load(std::memory_order_acquire) == leaf_v) {
         return {Status::NotFound};
       }
       continue;  // version changed, retry
@@ -215,8 +220,8 @@ LookupResult Tree::get(Key k) {
       }
     }
 
-    // Step 7: version check after read
-    if (root_->version.load(std::memory_order_acquire) == v) {
+    // Step 7: version check after read (leaf version for leaf-level ops)
+    if (leaf->version.load(std::memory_order_acquire) == leaf_v) {
       return r;
     }
     // Version changed -- retry
