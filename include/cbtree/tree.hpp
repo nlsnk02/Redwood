@@ -37,10 +37,9 @@ class Tree {
   // Test hooks (progressively exposed in later tasks)
   void set_probabilities(double p_parent, double p_placeholder);
   int debug_height() const;
-  bool debug_parent_cache_contains(Key k) const;
+  bool debug_cache_a_contains(Key k) const;
   Status debug_flush_all();
   bool debug_all_leaves_have_cache() const;
-  bool debug_root_has_cache() const;
 
   // Debug: eviction hooks (Task 11)
   void debug_clear_all_caches();
@@ -93,15 +92,14 @@ class Tree {
   static void collect_leaves_in_range(Node* node, Key lo, Key hi,
                                       std::vector<Node*>& leaves);
 
-  // Task 11: eviction helpers
   Node* find_leaf_for_key(Node* parent, Key k);
   void register_in_leaf_index(Node* leaf, Key k);
   Status evict_leaf_if_needed(Node* leaf);
-  Status evict_parent_if_needed(Node* parent);
+  Status evict_to_chunk(Node* leaf);
+  Status evict_cache_A_if_needed(Node* leaf);
   void flush_and_split_leaf(Node* leaf);
   // Chunk-based eviction: pack dirty slots into a chunk, push to the leaf's
   // own chain, then flush that leaf's chain to SSD inline.
-  Status evict_to_chunk(Node* leaf);
 
   // Hit-rate tracking: record one completed get() result.
   // When enable_hit_tracking_ is false, compiles to a single predictable
