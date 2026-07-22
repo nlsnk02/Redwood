@@ -449,55 +449,10 @@ void Tree::flush_leaf(Node* leaf) {
 Status Tree::put(Key k, Value v) {
   thread_local std::mt19937_64 rng(std::random_device{}());
 
-  // ---- Phase 1: check parent (root) cache for existing key ----
-  // We hold a shared_lock during cache lookup/upsert to protect against
-  // concurrent split_internal (which holds exclusive_lock while calling
-  // split_into on the cache).  The lock is released before we call
-  // evict_cache_A_if_needed or any eviction, to avoid deadlocking with
-  // split_leaf (which needs exclusive_lock).
-  {
-    std::shared_lock<std::shared_mutex> lock(tree_mutex_);
-    Node* root = root_;
-
-    if (root->height >= 2 && root->cache_A) {
-      LookupResult lr = root->cache_A->lookup(k);
-      bool exists_in_root =
-          (lr.status == Status::Ok) || root->cache_A->has_absent(k);
-
-      if (exists_in_root) {
-        Status s = root->cache_A->upsert(k, v);
-        if (s == Status::Ok) {
-          Node* saved_root = root;
-          lock.unlock();
-          evict_cache_A_if_needed(saved_root);
-          return Status::Ok;
-        }
-      } else {
-        bool use_parent = false;
-        if (p_parent_ >= 1.0) {
-          use_parent = true;
-        } else if (p_parent_ > 0.0) {
-          use_parent = std::bernoulli_distribution{p_parent_}(rng);
-        }
-
-        if (use_parent) {
-          Status s = root->cache_A->upsert(k, v);
-          if (s == Status::Ok) {
-            Node* saved_root = root;
-            lock.unlock();
-            evict_cache_A_if_needed(saved_root);
-            return Status::Ok;
-          }
-        }
-      }
-    }
-  }
-
-  // ---- Phase 2: descend to leaf ----
+  // Always descend to leaf first — no parent cache shortcut.
   std::vector<std::pair<Node*, uint64_t>> versions;
   Node* leaf = descend_to_leaf(k, versions);
 
-  // ---- Phase 3: leaf cache upsert (retry on Full, version check on split) ----
   constexpr int kMaxUpsertRetries = 256;
   for (int retry = 0; retry < kMaxUpsertRetries; ++retry) {
     versions.clear();
@@ -509,6 +464,39 @@ Status Tree::put(Key k, Value v) {
       continue;
     }
 
+    // Phase 1: try cache_A (hot cache, former parent semantics)
+    {
+      LookupResult lr = leaf->cache_A->lookup(k);
+      bool exists_in_A =
+          (lr.status == Status::Ok) || leaf->cache_A->has_absent(k);
+
+      if (exists_in_A) {
+        Status s = leaf->cache_A->upsert(k, v);
+        if (s == Status::Ok) {
+          if (leaf->version.load(std::memory_order_acquire) != leaf_v) continue;
+          evict_cache_A_if_needed(leaf);
+          return Status::Ok;
+        }
+      } else {
+        bool use_A = false;
+        if (p_parent_ >= 1.0) {
+          use_A = true;
+        } else if (p_parent_ > 0.0) {
+          use_A = std::bernoulli_distribution{p_parent_}(rng);
+        }
+
+        if (use_A) {
+          Status s = leaf->cache_A->upsert(k, v);
+          if (s == Status::Ok) {
+            if (leaf->version.load(std::memory_order_acquire) != leaf_v) continue;
+            evict_cache_A_if_needed(leaf);
+            return Status::Ok;
+          }
+        }
+      }
+    }
+
+    // Phase 2: upsert into cache_B (local cache)
     Status s = leaf->cache_B->upsert(k, v);
     if (s == Status::Ok) {
       if (leaf->version.load(std::memory_order_acquire) != leaf_v) continue;
@@ -518,6 +506,7 @@ Status Tree::put(Key k, Value v) {
 
     if (s != Status::Full) return s;
 
+    // cache_B full — evict to make room
     Status evict_s = evict_to_chunk(leaf);
     if (evict_s == Status::Retry) {
       std::this_thread::yield();
