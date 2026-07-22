@@ -376,6 +376,32 @@ void CacheAttachment::flush_dirty(std::vector<std::pair<Key, Value>>& out) {
   }
 }
 
+bool CacheAttachment::evict_clean_slot(Key k) {
+  Fingerprint fp = fingerprint(k);
+  for (int i = 0; i < kCacheSlots; ++i) {
+    std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
+    if (slots_[i].state != SlotState::Occupied) continue;
+    if (slots_[i].fp != fp) continue;
+    if (slots_[i].key != k) continue;
+    // Only clear if clean — another thread may have re-dirtied it.
+    if (slots_[i].dirty) return false;
+    slots_[i].state = SlotState::Empty;
+    slots_[i].clock_bit.store(false, std::memory_order_release);
+    return true;
+  }
+  return false;
+}
+
+void CacheAttachment::clear_clean_occupied() {
+  for (int i = 0; i < kCacheSlots; ++i) {
+    std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
+    if (slots_[i].state == SlotState::Occupied && !slots_[i].dirty) {
+      slots_[i].state = SlotState::Empty;
+      slots_[i].clock_bit.store(false, std::memory_order_release);
+    }
+  }
+}
+
 void CacheAttachment::clear() {
   for (int i = 0; i < kCacheSlots; ++i) {
     std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);

@@ -53,6 +53,12 @@ class CacheAttachment {
   Status split_into(Key mid, CacheAttachment* right);
   std::vector<std::pair<Key, Value>> occupied_sorted();
   void flush_dirty(std::vector<std::pair<Key, Value>>& out);
+  // Clear all Occupied slots that are NOT dirty (i.e., already flushed).
+  // Safe to call after SSD write — data loss if called before.
+  void clear_clean_occupied();
+  // Clear a specific slot by key, but ONLY if Occupied and clean (!dirty).
+  // Returns true if the slot was cleared.
+  bool evict_clean_slot(Key k);
 
   // Task 12: range scan helpers
   void sort_and_set_flag();

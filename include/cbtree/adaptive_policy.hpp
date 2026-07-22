@@ -6,6 +6,7 @@ struct Stats {
   double leaf_hit_rate{0.0};
   double clock_eviction_rate{0.0};
   double ssd_io_count{0.0};
+  double memory_hit_rate{0.0};  // fraction of get() served without SSD I/O
 };
 struct Probabilities {
   double p_parent{kDefaultPParent};

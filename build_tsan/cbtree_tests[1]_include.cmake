@@ -1,0 +1,5 @@
+if(EXISTS "/home/u332/mytree/build_tsan/cbtree_tests[1]_tests.cmake")
+  include("/home/u332/mytree/build_tsan/cbtree_tests[1]_tests.cmake")
+else()
+  add_test(cbtree_tests_NOT_BUILT cbtree_tests_NOT_BUILT)
+endif()

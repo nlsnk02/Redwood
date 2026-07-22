@@ -1,0 +1,2 @@
+/usr/bin/ar qc libcbtree.a CMakeFiles/cbtree.dir/src/fingerprint.cpp.o CMakeFiles/cbtree.dir/src/key_lock_table.cpp.o CMakeFiles/cbtree.dir/src/cache_attachment.cpp.o CMakeFiles/cbtree.dir/src/ssd_page_store.cpp.o CMakeFiles/cbtree.dir/src/node.cpp.o CMakeFiles/cbtree.dir/src/tree.cpp.o CMakeFiles/cbtree.dir/src/adaptive_policy.cpp.o CMakeFiles/cbtree.dir/src/wal_sink.cpp.o CMakeFiles/cbtree.dir/src/delete_ops.cpp.o
+/usr/bin/ranlib libcbtree.a

@@ -41,8 +41,13 @@ static const Record* record_at(const std::array<std::byte, kPageSize>& page, uin
   return reinterpret_cast<const Record*>(page.data() + kHeaderSize + index * kRecordSize);
 }
 
-SsDPageStore::SsDPageStore(const std::string& file_path) {
-  fd_ = open(file_path.c_str(), O_RDWR | O_CREAT, 0644);
+SsDPageStore::SsDPageStore(const std::string& file_path, bool use_direct)
+    : fd_(-1), use_direct_(use_direct) {
+  int flags = O_RDWR | O_CREAT;
+  if (use_direct_) {
+    flags |= O_DIRECT;
+  }
+  fd_ = open(file_path.c_str(), flags, 0644);
   if (fd_ < 0) {
     fd_ = -1;
   }
@@ -69,15 +74,39 @@ static off_t page_offset(PageId id) {
 
 Status SsDPageStore::write_page(PageId id, const std::array<std::byte, kPageSize>& buf) {
   off_t off = page_offset(id);
-  ssize_t written = pwrite(fd_, buf.data(), kPageSize, off);
+  const void* wr_buf;
+  if (use_direct_) {
+    // O_DIRECT requires aligned buffers — copy through the bounce buffer.
+    std::memcpy(dio_buf_.data(), buf.data(), kPageSize);
+    wr_buf = dio_buf_.data();
+  } else {
+    wr_buf = buf.data();
+  }
+  ssize_t written = pwrite(fd_, wr_buf, kPageSize, off);
   if (written != static_cast<ssize_t>(kPageSize)) return Status::Error;
+  return Status::Ok;
+}
+
+Status SsDPageStore::sync() {
+  // Direct I/O writes directly to the storage device — no page cache to flush.
+  // In buffered mode, fdatasync would be called here, but we no longer use
+  // that mode.  Kept as a no-op for API compatibility.
   return Status::Ok;
 }
 
 Status SsDPageStore::read_page(PageId id, std::array<std::byte, kPageSize>& buf) {
   off_t off = page_offset(id);
-  ssize_t n = pread(fd_, buf.data(), kPageSize, off);
+  void* rd_buf;
+  if (use_direct_) {
+    rd_buf = dio_buf_.data();
+  } else {
+    rd_buf = buf.data();
+  }
+  ssize_t n = pread(fd_, rd_buf, kPageSize, off);
   if (n != static_cast<ssize_t>(kPageSize)) return Status::Error;
+  if (use_direct_) {
+    std::memcpy(buf.data(), dio_buf_.data(), kPageSize);
+  }
   return Status::Ok;
 }
 
@@ -107,6 +136,44 @@ Status SsDPageStore::put_record(PageId id, Key key, Value value) {
   rec->key = key;
   rec->value = value;
   count++;
+  write_count(page, count);
+  return write_page(id, page);
+}
+
+Status SsDPageStore::write_page_entries(
+    PageId id, const std::vector<std::pair<Key, Value>>& entries,
+    std::vector<std::pair<Key, Value>>& overflow) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  std::array<std::byte, kPageSize> page{};
+  Status s = read_page(id, page);
+  if (s != Status::Ok) return s;
+
+  uint32_t count = read_count(page);
+
+  for (const auto& [key, value] : entries) {
+    // Check for existing key — update in-place
+    bool found = false;
+    for (uint32_t i = 0; i < count; ++i) {
+      Record* rec = record_at(page, i);
+      if (rec->key == key) {
+        rec->value = value;
+        found = true;
+        break;
+      }
+    }
+    if (found) continue;
+
+    // Not found — try to append
+    if (count >= static_cast<uint32_t>(kMaxRecordsPerPage)) {
+      overflow.push_back({key, value});
+      continue;
+    }
+    Record* rec = record_at(page, count);
+    rec->key = key;
+    rec->value = value;
+    count++;
+  }
+
   write_count(page, count);
   return write_page(id, page);
 }

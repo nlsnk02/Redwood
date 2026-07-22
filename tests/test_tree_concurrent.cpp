@@ -19,7 +19,7 @@ class TreeConcurrentTest : public ::testing::Test {
   std::unique_ptr<cbtree::Tree> tree_;
 };
 
-// kCacheSlots=16, kMaxRecordsPerPage=255 => max 271 keys.
+// kCacheSlots=64, kMaxRecordsPerPage=255 => max 319 keys.
 // Use 8x30=240 to stay within single-page capacity.
 TEST_F(TreeConcurrentTest, ParallelPutGet) {
   constexpr int kThreads = 8;
