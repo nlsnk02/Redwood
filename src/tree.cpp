@@ -15,7 +15,8 @@ Tree::Tree(const std::string& ssd_path, bool use_direct)
     : ssd_(std::make_unique<SsDPageStore>(ssd_path, use_direct)) {
   root_ = new Node{};
   root_->height = 1;
-  root_->cache = std::make_unique<CacheAttachment>();
+  root_->cache_A = std::make_unique<CacheAttachment>();
+  root_->cache_B = std::make_unique<CacheAttachment>();
   root_->page_id = ssd_->alloc_page();
 }
 
@@ -106,10 +107,9 @@ void Tree::register_in_leaf_index(Node* leaf, Key k) {
 }
 
 Status Tree::evict_leaf_if_needed(Node* leaf) {
-  if (leaf->cache->occupied_count() <=
+  if (leaf->cache_B->occupied_count() <=
       static_cast<int>(kCacheSlots * kLeafFillThreshold))
     return Status::Ok;
-  // Chunk-based eviction: pack dirty slots into chunk, SSD write deferred.
   Status s = evict_to_chunk(leaf);
   return (s == Status::Retry) ? Status::Ok : s;
 }
@@ -122,9 +122,9 @@ Status Tree::evict_to_chunk(Node* leaf) {
 
   // 1. Collect all dirty entries and mark them clean (keeps slots Occupied).
   std::vector<std::pair<Key, Value>> dirty;
-  leaf->cache->flush_dirty(dirty);
+  leaf->cache_B->flush_dirty(dirty);
   if (dirty.empty()) {
-    leaf->cache->clear_clean_occupied();
+    leaf->cache_B->clear_clean_occupied();
     return Status::Ok;
   }
 
@@ -156,7 +156,7 @@ Status Tree::evict_to_chunk(Node* leaf) {
   //    Only clears slots that are still clean (not re-dirtied by another
   //    thread). Re-dirtied slots stay Occupied for the next eviction.
   for (const auto& [k, v] : dirty) {
-    leaf->cache->evict_clean_slot(k);
+    leaf->cache_B->evict_clean_slot(k);
   }
 
   // 5. RELEASE eviction_mutex BEFORE flushing to SSD.
@@ -173,8 +173,8 @@ Status Tree::evict_to_chunk(Node* leaf) {
   return Status::Ok;
 }
 
-Status Tree::evict_parent_if_needed(Node* parent) {
-  if (parent->cache->occupied_count() <=
+Status Tree::evict_cache_A_if_needed(Node* leaf) {
+  if (leaf->cache_A->occupied_count() <=
       static_cast<int>(kCacheSlots * kParentFillThreshold))
     return Status::Ok;
   Key victim_key = 0;
@@ -182,23 +182,18 @@ Status Tree::evict_parent_if_needed(Node* parent) {
   bool victim_dirty = false;
   int victim_idx = -1;
   uint32_t victim_gen = 0;
-  if (parent->cache->find_clock_victim(&victim_key, &victim_val, &victim_dirty,
+  if (leaf->cache_A->find_clock_victim(&victim_key, &victim_val, &victim_dirty,
                                        &victim_idx, &victim_gen) != Status::Ok)
     return Status::Ok;
 
   if (victim_dirty) {
-    Node* leaf = find_leaf_for_key(parent, victim_key);
-    uint64_t leaf_v_before = leaf->version.load(std::memory_order_acquire);
-    evict_leaf_if_needed(leaf);
-    // Optimistic: re-descend only if the leaf actually split during eviction.
-    // evict_leaf_if_needed → flush_all_chunks → split_leaf bumps version from
-    // V→V+1 (lock) → V+2 (unlock), so version change == split occurred.
-    if (leaf->version.load(std::memory_order_acquire) != leaf_v_before) {
-      leaf = find_leaf_for_key(parent, victim_key);
+    // Demote to cache_B on same leaf — no re-descent needed.
+    if (leaf->cache_B) {
+      evict_leaf_if_needed(leaf);  // ensure cache_B has room
+      leaf->cache_B->upsert(victim_key, victim_val);
     }
-    leaf->cache->upsert(victim_key, victim_val);
   }
-  parent->cache->evict_slot(victim_idx, victim_key, victim_gen);
+  leaf->cache_A->evict_slot(victim_idx, victim_key, victim_gen);
   return Status::Ok;
 }
 
@@ -360,7 +355,7 @@ void Tree::flush_leaf(Node* leaf) {
       Status s = ssd_->write_page_entries(pid, entries, overflow);
       if (s != Status::Ok) {
         Node* n = page_leaf[pid];
-        for (const auto& [key, val] : entries) n->cache->upsert(key, val);
+        for (const auto& [key, val] : entries) n->cache_B->upsert(key, val);
         return;
       }
 
@@ -386,7 +381,7 @@ void Tree::flush_leaf(Node* leaf) {
         flush_and_split_leaf(target);
         Node* correct = find_leaf_for_key(
             target->parent ? target->parent : root_, key);
-        correct->cache->upsert(key, val);
+        correct->cache_B->upsert(key, val);
       }
     };
 
@@ -458,23 +453,23 @@ Status Tree::put(Key k, Value v) {
   // We hold a shared_lock during cache lookup/upsert to protect against
   // concurrent split_internal (which holds exclusive_lock while calling
   // split_into on the cache).  The lock is released before we call
-  // evict_parent_if_needed or any eviction, to avoid deadlocking with
+  // evict_cache_A_if_needed or any eviction, to avoid deadlocking with
   // split_leaf (which needs exclusive_lock).
   {
     std::shared_lock<std::shared_mutex> lock(tree_mutex_);
     Node* root = root_;
 
-    if (root->height >= 2 && root->cache) {
-      LookupResult lr = root->cache->lookup(k);
+    if (root->height >= 2 && root->cache_A) {
+      LookupResult lr = root->cache_A->lookup(k);
       bool exists_in_root =
-          (lr.status == Status::Ok) || root->cache->has_absent(k);
+          (lr.status == Status::Ok) || root->cache_A->has_absent(k);
 
       if (exists_in_root) {
-        Status s = root->cache->upsert(k, v);
+        Status s = root->cache_A->upsert(k, v);
         if (s == Status::Ok) {
           Node* saved_root = root;
           lock.unlock();
-          evict_parent_if_needed(saved_root);
+          evict_cache_A_if_needed(saved_root);
           return Status::Ok;
         }
       } else {
@@ -486,11 +481,11 @@ Status Tree::put(Key k, Value v) {
         }
 
         if (use_parent) {
-          Status s = root->cache->upsert(k, v);
+          Status s = root->cache_A->upsert(k, v);
           if (s == Status::Ok) {
             Node* saved_root = root;
             lock.unlock();
-            evict_parent_if_needed(saved_root);
+            evict_cache_A_if_needed(saved_root);
             return Status::Ok;
           }
         }
@@ -514,7 +509,7 @@ Status Tree::put(Key k, Value v) {
       continue;
     }
 
-    Status s = leaf->cache->upsert(k, v);
+    Status s = leaf->cache_B->upsert(k, v);
     if (s == Status::Ok) {
       if (leaf->version.load(std::memory_order_acquire) != leaf_v) continue;
       evict_leaf_if_needed(leaf);
@@ -595,8 +590,8 @@ std::vector<std::pair<Key, Value>> Tree::scan(Key lo, Key hi) {
 
   for (Node* leaf : leaves) {
     // ---- Parent cache (authority 0) ----
-    if (leaf->parent && leaf->parent->height == 2 && leaf->parent->cache) {
-      CacheAttachment* pc = leaf->parent->cache.get();
+    if (leaf->parent && leaf->parent->height == 2 && leaf->parent->cache_A) {
+      CacheAttachment* pc = leaf->parent->cache_A.get();
       if (processed_parents.insert(pc).second) {
         if (!pc->sorted_flag()) pc->sort_and_set_flag();
         auto occ = pc->occupied_sorted();
@@ -615,7 +610,7 @@ std::vector<std::pair<Key, Value>> Tree::scan(Key lo, Key hi) {
     }
 
     // ---- Leaf cache (authority 1) ----
-    CacheAttachment* lc = leaf->cache.get();
+    CacheAttachment* lc = leaf->cache_B.get();
     if (!lc->sorted_flag()) lc->sort_and_set_flag();
     auto occ = lc->occupied_sorted();
     for (const auto& [k, v] : occ) {
@@ -697,13 +692,13 @@ LookupResult Tree::get(Key k) {
 
     // Step 2: cache lookup — top-down
     // (a) root cache (present only when tree height == 2)
-    if (root->height >= 2 && root->cache) {
-      LookupResult pr = root->cache->lookup(k);
+    if (root->height >= 2 && root->cache_A) {
+      LookupResult pr = root->cache_A->lookup(k);
       if (pr.status == Status::Ok) {
         record_get_hit(true);
         return pr;
       }
-      if (root->cache->has_absent(k)) {
+      if (root->cache_A->has_absent(k)) {
         record_get_hit(true);
         return {Status::NotFound};
       }
@@ -711,25 +706,25 @@ LookupResult Tree::get(Key k) {
     // (b) leaf's parent cache (height-2 internal node) — needed when
     //     tree height >= 3 (root has no cache).  scan() already checks
     //     this; get() must do the same to stay consistent.
-    if (!root->cache && leaf->parent && leaf->parent->height == 2 &&
-        leaf->parent->cache) {
-      LookupResult pr = leaf->parent->cache->lookup(k);
+    if (!root->cache_A && leaf->parent && leaf->parent->height == 2 &&
+        leaf->parent->cache_A) {
+      LookupResult pr = leaf->parent->cache_A->lookup(k);
       if (pr.status == Status::Ok) {
         record_get_hit(true);
         return pr;
       }
-      if (leaf->parent->cache->has_absent(k)) {
+      if (leaf->parent->cache_A->has_absent(k)) {
         record_get_hit(true);
         return {Status::NotFound};
       }
     }
 
-    LookupResult r = leaf->cache->lookup(k);
+    LookupResult r = leaf->cache_B->lookup(k);
     if (r.status == Status::Ok) {
       record_get_hit(true);
       return r;
     }
-    if (leaf->cache->has_absent(k)) {
+    if (leaf->cache_B->has_absent(k)) {
       record_get_hit(true);
       return {Status::NotFound};
     }
@@ -745,11 +740,11 @@ LookupResult Tree::get(Key k) {
     bool has_placed = false;
     int placeholder_idx = -1;
     if (p_placeholder_ >= 1.0) {
-      Status ps = leaf->cache->try_place_placeholder(k, &placeholder_idx);
+      Status ps = leaf->cache_B->try_place_placeholder(k, &placeholder_idx);
       has_placed = (ps == Status::Ok);
     } else if (p_placeholder_ > 0.0) {
       if (std::bernoulli_distribution{p_placeholder_}(rng)) {
-        Status ps = leaf->cache->try_place_placeholder(k, &placeholder_idx);
+        Status ps = leaf->cache_B->try_place_placeholder(k, &placeholder_idx);
         has_placed = (ps == Status::Ok);
       }
     }
@@ -758,10 +753,10 @@ LookupResult Tree::get(Key k) {
     r = ssd_->get_record(leaf->page_id, k);
 
     // Step 5: post-SSD cache recheck
-    LookupResult r2 = leaf->cache->lookup(k);
+    LookupResult r2 = leaf->cache_B->lookup(k);
     if (r2.status == Status::Ok) {
       if (has_placed) {
-        leaf->cache->fill_placeholder(placeholder_idx, r2.value);
+        leaf->cache_B->fill_placeholder(placeholder_idx, r2.value);
       }
       if (leaf->version.load(std::memory_order_acquire) == leaf_v) {
         record_get_hit(false);
@@ -769,9 +764,9 @@ LookupResult Tree::get(Key k) {
       }
       continue;
     }
-    if (leaf->cache->has_absent(k)) {
+    if (leaf->cache_B->has_absent(k)) {
       if (has_placed) {
-        leaf->cache->fill_placeholder_absent(placeholder_idx);
+        leaf->cache_B->fill_placeholder_absent(placeholder_idx);
       }
       if (leaf->version.load(std::memory_order_acquire) == leaf_v) {
         record_get_hit(false);
@@ -783,9 +778,9 @@ LookupResult Tree::get(Key k) {
     // Step 6: fill placeholder based on SSD result
     if (has_placed) {
       if (r.status == Status::Ok) {
-        leaf->cache->fill_placeholder(placeholder_idx, r.value);
+        leaf->cache_B->fill_placeholder(placeholder_idx, r.value);
       } else {
-        leaf->cache->fill_placeholder_absent(placeholder_idx);
+        leaf->cache_B->fill_placeholder_absent(placeholder_idx);
       }
     }
 
@@ -808,11 +803,11 @@ int Tree::debug_height() const {
   return root_->height;
 }
 
-bool Tree::debug_parent_cache_contains(Key k) const {
-  if (root_->height < 2 || !root_->cache) return false;
-  LookupResult r = root_->cache->lookup(k);
+bool Tree::debug_cache_a_contains(Key k) const {
+  if (root_->height < 2 || !root_->cache_A) return false;
+  LookupResult r = root_->cache_A->lookup(k);
   if (r.status == Status::Ok) return true;
-  return root_->cache->has_absent(k);
+  return root_->cache_A->has_absent(k);
 }
 
 void Tree::collect_leaves(const Node* node, std::vector<const Node*>& leaves) {
@@ -859,10 +854,10 @@ Status Tree::debug_flush_all() {
     for (Node* leaf : leaves) {
       std::lock_guard<std::mutex> lock(leaf->eviction_mutex);
       std::vector<std::pair<Key, Value>> dirty;
-      leaf->cache->flush_dirty(dirty);
+      leaf->cache_B->flush_dirty(dirty);
       if (dirty.empty()) {
-        leaf->cache->clear_clean_occupied();
-        if (leaf->cache->occupied_count() > 0) any_entries = true;
+        leaf->cache_B->clear_clean_occupied();
+        if (leaf->cache_B->occupied_count() > 0) any_entries = true;
         continue;
       }
       any_entries = true;
@@ -883,27 +878,27 @@ Status Tree::debug_flush_all() {
       leaf->chunk_count_.fetch_add(1, std::memory_order_relaxed);
 
       for (const auto& [k, v] : dirty) {
-        leaf->cache->evict_clean_slot(k);
+        leaf->cache_B->evict_clean_slot(k);
       }
     }
 
     // 2. Flush parent cache dirty entries to leaf caches, then evict.
-    if (root_->height >= 2 && root_->cache) {
-      if (root_->cache->occupied_count() > 0) any_entries = true;
+    if (root_->height >= 2 && root_->cache_A) {
+      if (root_->cache_A->occupied_count() > 0) any_entries = true;
       std::vector<std::pair<Key, Value>> root_dirty;
-      root_->cache->flush_dirty(root_dirty);
+      root_->cache_A->flush_dirty(root_dirty);
       for (const auto& [k, v] : root_dirty) {
         Node* leaf = find_leaf_for_key(root_, k);
-        leaf->cache->upsert(k, v);
+        leaf->cache_B->upsert(k, v);
       }
-      root_->cache->clear_clean_occupied();
+      root_->cache_A->clear_clean_occupied();
 
       for (Node* leaf : leaves) {
         std::lock_guard<std::mutex> lock(leaf->eviction_mutex);
         std::vector<std::pair<Key, Value>> dirty;
-        leaf->cache->flush_dirty(dirty);
+        leaf->cache_B->flush_dirty(dirty);
         if (dirty.empty()) {
-          leaf->cache->clear_clean_occupied();
+          leaf->cache_B->clear_clean_occupied();
           continue;
         }
         any_entries = true;
@@ -924,7 +919,7 @@ Status Tree::debug_flush_all() {
         leaf->chunk_count_.fetch_add(1, std::memory_order_relaxed);
 
         for (const auto& [k, v] : dirty) {
-          leaf->cache->evict_clean_slot(k);
+          leaf->cache_B->evict_clean_slot(k);
         }
       }
     }
@@ -985,7 +980,8 @@ void Tree::split_leaf(Node* leaf) {
 
   Node* L_right = new Node{};
   L_right->height = 1;
-  L_right->cache = std::make_unique<CacheAttachment>();
+  L_right->cache_A = std::make_unique<CacheAttachment>();
+  L_right->cache_B = std::make_unique<CacheAttachment>();
   L_right->page_id = new_right_id;
 
   std::vector<Key> left_keys;
@@ -1007,7 +1003,7 @@ void Tree::split_leaf(Node* leaf) {
   L_right->leaf_keys = std::move(right_keys);
   L_right->leaf_page_ids = std::move(right_pids);
 
-  leaf->cache->split_into(mid, L_right->cache.get());
+  leaf->cache_B->split_into(mid, L_right->cache_B.get());
 
   // ---- B-link protocol (Lehman & Yao 1981) ----
   // Step 1: link new right sibling BEFORE updating high_key bounds.
@@ -1035,7 +1031,7 @@ void Tree::split_leaf(Node* leaf) {
   if (leaf == root_) {
     Node* new_root = new Node{};
     new_root->height = 2;
-    new_root->cache = std::make_unique<CacheAttachment>();
+    new_root->cache_A = std::make_unique<CacheAttachment>();
     new_root->separators.reserve(kInternalFanout + 1);
     new_root->children.reserve(kInternalFanout + 1);
     new_root->separators.push_back(mid);
@@ -1073,27 +1069,27 @@ void Tree::split_internal(Node* node) {
   size_t mid_idx = node->separators.size() / 2;
   Key mid = node->separators[mid_idx];
 
-  if (node->height >= 3 && node->cache) {
-    if (!node->cache->sorted_flag()) node->cache->sort_and_set_flag();
-    auto occ = node->cache->occupied_sorted();
+  if (node->height >= 3 && node->cache_A) {
+    if (!node->cache_A->sorted_flag()) node->cache_A->sort_and_set_flag();
+    auto occ = node->cache_A->occupied_sorted();
     for (const auto& [k, v] : occ) {
       auto it = std::upper_bound(node->separators.begin(), node->separators.end(), k);
       size_t child_idx = static_cast<size_t>(it - node->separators.begin());
       Node* child = node->children[child_idx];
-      if (child->cache) {
-        child->cache->upsert(k, v);
+      if (child->cache_A) {
+        child->cache_A->upsert(k, v);
       }
     }
-    auto abs = node->cache->absent_keys();
+    auto abs = node->cache_A->absent_keys();
     for (Key k : abs) {
       auto it = std::upper_bound(node->separators.begin(), node->separators.end(), k);
       size_t child_idx = static_cast<size_t>(it - node->separators.begin());
       Node* child = node->children[child_idx];
-      if (child->cache) {
-        child->cache->mark_absent(k);
+      if (child->cache_A) {
+        child->cache_A->mark_absent(k);
       }
     }
-    node->cache = nullptr;
+    node->cache_A = nullptr;
   }
 
   Node* new_node = new Node{};
@@ -1101,7 +1097,7 @@ void Tree::split_internal(Node* node) {
   new_node->separators.reserve(kInternalFanout + 2);
   new_node->children.reserve(kInternalFanout + 2);
   if (new_node->height == 2) {
-    new_node->cache = std::make_unique<CacheAttachment>();
+    new_node->cache_A = std::make_unique<CacheAttachment>();
   }
 
   new_node->separators.assign(node->separators.begin() + static_cast<long>(mid_idx) + 1,
@@ -1117,7 +1113,7 @@ void Tree::split_internal(Node* node) {
   node->children.resize(mid_idx + 1);
 
   if (node->height == 2) {
-    node->cache->split_into(mid, new_node->cache.get());
+    node->cache_A->split_into(mid, new_node->cache_A.get());
   }
 
   // ---- B-link protocol ----
@@ -1142,7 +1138,7 @@ void Tree::split_internal(Node* node) {
     new_root->separators.reserve(kInternalFanout + 2);
     new_root->children.reserve(kInternalFanout + 2);
     if (new_root->height < 3) {
-      new_root->cache = std::make_unique<CacheAttachment>();
+      new_root->cache_A = std::make_unique<CacheAttachment>();
     }
     new_root->separators.push_back(mid);
     new_root->children.push_back(node);
@@ -1175,13 +1171,13 @@ bool Tree::debug_all_leaves_have_cache() const {
   std::vector<const Node*> leaves;
   collect_leaves(root_, leaves);
   for (const Node* leaf : leaves) {
-    if (!leaf->cache) return false;
+    if (!leaf->cache_B) return false;
   }
   return true;
 }
 
 bool Tree::debug_root_has_cache() const {
-  return root_->cache != nullptr;
+  return root_->cache_A != nullptr;
 }
 
 bool Tree::debug_height3_nodes_have_no_cache() const {
@@ -1191,7 +1187,7 @@ bool Tree::debug_height3_nodes_have_no_cache() const {
     const Node* node = stack.back();
     stack.pop_back();
     if (!node) continue;
-    if (node->height >= 3 && node->cache) return false;
+    if (node->height >= 3 && (node->cache_A || node->cache_B)) return false;
     for (Node* child : node->children) {
       stack.push_back(child);
     }
@@ -1203,9 +1199,10 @@ void Tree::debug_clear_all_caches() {
   std::vector<Node*> leaves;
   collect_leaves(root_, leaves);
   for (Node* leaf : leaves) {
-    if (leaf->cache) leaf->cache->clear();
+    if (leaf->cache_B) leaf->cache_B->clear();
+    if (leaf->cache_A) leaf->cache_A->clear();
   }
-  if (root_->cache) root_->cache->clear();
+  if (root_->cache_A) root_->cache_A->clear();
 }
 
 bool Tree::debug_leaf_index_empty() const {
@@ -1221,7 +1218,7 @@ bool Tree::debug_some_keys_in_leaf_cache() const {
   std::vector<const Node*> leaves;
   collect_leaves(root_, leaves);
   for (const Node* leaf : leaves) {
-    if (leaf->cache && leaf->cache->occupied_count() > 0) return true;
+    if (leaf->cache_B && leaf->cache_B->occupied_count() > 0) return true;
   }
   return false;
 }
@@ -1275,13 +1272,15 @@ std::unique_ptr<Tree> Tree::DebugTwoLeaves(const std::string& ssd_path) {
 
   Node* leaf0 = new Node{};
   leaf0->height = 1;
-  leaf0->cache = std::make_unique<CacheAttachment>();
+  leaf0->cache_A = std::make_unique<CacheAttachment>();
+  leaf0->cache_B = std::make_unique<CacheAttachment>();
   leaf0->page_id = t->ssd_->alloc_page();
   leaf0->high_key = 50;                           // separator to leaf1
 
   Node* leaf1 = new Node{};
   leaf1->height = 1;
-  leaf1->cache = std::make_unique<CacheAttachment>();
+  leaf1->cache_A = std::make_unique<CacheAttachment>();
+  leaf1->cache_B = std::make_unique<CacheAttachment>();
   leaf1->page_id = t->ssd_->alloc_page();
   // leaf1->high_key defaults to max (rightmost)
 
@@ -1290,7 +1289,7 @@ std::unique_ptr<Tree> Tree::DebugTwoLeaves(const std::string& ssd_path) {
 
   Node* root = new Node{};
   root->height = 2;
-  root->cache = std::make_unique<CacheAttachment>();
+  root->cache_A = std::make_unique<CacheAttachment>();
   root->separators.reserve(kInternalFanout + 2);
   root->children.reserve(kInternalFanout + 2);
   root->separators.push_back(50);
