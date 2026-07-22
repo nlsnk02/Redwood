@@ -963,6 +963,7 @@ void Tree::split_leaf(Node* leaf) {
   L_right->leaf_keys = std::move(right_keys);
   L_right->leaf_page_ids = std::move(right_pids);
 
+  leaf->cache_A->split_into(mid, L_right->cache_A.get());
   leaf->cache_B->split_into(mid, L_right->cache_B.get());
 
   // ---- B-link protocol (Lehman & Yao 1981) ----
@@ -991,7 +992,6 @@ void Tree::split_leaf(Node* leaf) {
   if (leaf == root_) {
     Node* new_root = new Node{};
     new_root->height = 2;
-    new_root->cache_A = std::make_unique<CacheAttachment>();
     new_root->separators.reserve(kInternalFanout + 1);
     new_root->children.reserve(kInternalFanout + 1);
     new_root->separators.push_back(mid);
@@ -1072,7 +1072,7 @@ void Tree::split_internal(Node* node) {
   node->separators.resize(mid_idx);
   node->children.resize(mid_idx + 1);
 
-  if (node->height == 2) {
+  if (node->height == 2 && node->cache_A) {
     node->cache_A->split_into(mid, new_node->cache_A.get());
   }
 

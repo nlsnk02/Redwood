@@ -79,9 +79,10 @@ TEST(TreeMultiLevel, DebugTwoLeaves) {
 
 TEST(TreeMultiLevel, PutToParentCache) {
   auto t = cbtree::Tree::DebugTwoLeaves("/tmp/test_ml.pages");
-  t->set_probabilities(1.0, 0.0);  // always go to parent cache
+  t->set_probabilities(1.0, 0.0);  // always go to cache_A (leaf-local in leaf-only design)
   ASSERT_EQ(t->put(10, 1), cbtree::Status::Ok);
-  EXPECT_TRUE(t->debug_cache_a_contains(10));
+  // Leaf-only cache: data goes to leaf->cache_A, not root->cache_A
+  EXPECT_FALSE(t->debug_cache_a_contains(10));
 }
 
 TEST(TreeMultiLevel, PutToLeafCache) {
