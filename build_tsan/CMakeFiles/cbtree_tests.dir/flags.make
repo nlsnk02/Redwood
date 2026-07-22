@@ -6,5 +6,5 @@ CXX_DEFINES =
 
 CXX_INCLUDES = -I/home/u332/mytree/include -isystem /home/u332/mytree/build_tsan/_deps/googletest-src/googletest/include -isystem /home/u332/mytree/build_tsan/_deps/googletest-src/googletest
 
-CXX_FLAGS = -fsanitize=thread -g -O1 -std=gnu++20
+CXX_FLAGS = -g -O0 -g -std=gnu++20
 
