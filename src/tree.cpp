@@ -541,26 +541,19 @@ void Tree::collect_leaves_in_range(Node* node, Key lo, Key hi,
 
 std::vector<std::pair<Key, Value>> Tree::scan(Key lo, Key hi) {
   // 1. Find leaves overlapping [lo, hi] via B-link sibling traversal.
-  //    descend_to_leaf returns the leaf containing lo (or the leftmost leaf
-  //    if lo is before all keys).  We then walk right via next_sibling until
-  //    we pass hi.  No shared_lock needed — concurrent splits are handled
-  //    by the B-link right-link protocol.
   static constexpr Key kInf = std::numeric_limits<Key>::max();
   std::vector<Node*> leaves;
   {
     std::vector<std::pair<Node*, uint64_t>> dummy;
     Node* leaf = descend_to_leaf(lo, dummy);
 
-    // If lo is beyond this leaf's range, chase right-links to the correct leaf.
     while (leaf && leaf->high_key != kInf && lo >= leaf->high_key) {
       leaf = leaf->next_sibling.load(std::memory_order_acquire);
     }
 
     while (leaf) {
       leaves.push_back(leaf);
-      // If hi is strictly before the next leaf's start, we're done.
       if (hi < leaf->high_key) break;
-      // Otherwise, there may be keys <= hi in the next leaf.
       leaf = leaf->next_sibling.load(std::memory_order_acquire);
     }
   }
@@ -568,41 +561,35 @@ std::vector<std::pair<Key, Value>> Tree::scan(Key lo, Key hi) {
   if (leaves.empty()) return {};
 
   // 2. Build result map: key -> (value, authority)
-  //    authority: 0 = parent cache, 1 = leaf cache, 2 = chunks, 3 = SSD
+  //    authority: 0 = cache_A, 1 = cache_B, 2 = chunks, 3 = SSD
   struct AuthEntry {
     Value value;
     int authority;
   };
   std::map<Key, AuthEntry> merged;
 
-  std::set<CacheAttachment*> processed_parents;
-
   for (Node* leaf : leaves) {
-    // ---- Parent cache (authority 0) ----
-    if (leaf->parent && leaf->parent->height == 2 && leaf->parent->cache_A) {
-      CacheAttachment* pc = leaf->parent->cache_A.get();
-      if (processed_parents.insert(pc).second) {
-        if (!pc->sorted_flag()) pc->sort_and_set_flag();
-        auto occ = pc->occupied_sorted();
-        for (const auto& [k, v] : occ) {
-          if (k >= lo && k <= hi) {
-            merged[k] = {v, 0};
-          }
-        }
-        auto abs = pc->absent_keys();
-        for (Key k : abs) {
-          if (k >= lo && k <= hi) {
-            merged[k] = {0, -1};
-          }
-        }
+    // ---- cache_A (authority 0, highest) ----
+    CacheAttachment* ca = leaf->cache_A.get();
+    if (!ca->sorted_flag()) ca->sort_and_set_flag();
+    auto occ = ca->occupied_sorted();
+    for (const auto& [k, v] : occ) {
+      if (k >= lo && k <= hi) {
+        merged[k] = {v, 0};
+      }
+    }
+    auto abs_a = ca->absent_keys();
+    for (Key k : abs_a) {
+      if (k >= lo && k <= hi) {
+        merged[k] = {0, -1};
       }
     }
 
-    // ---- Leaf cache (authority 1) ----
-    CacheAttachment* lc = leaf->cache_B.get();
-    if (!lc->sorted_flag()) lc->sort_and_set_flag();
-    auto occ = lc->occupied_sorted();
-    for (const auto& [k, v] : occ) {
+    // ---- cache_B (authority 1) ----
+    CacheAttachment* cb = leaf->cache_B.get();
+    if (!cb->sorted_flag()) cb->sort_and_set_flag();
+    auto occ_b = cb->occupied_sorted();
+    for (const auto& [k, v] : occ_b) {
       if (k >= lo && k <= hi) {
         auto it = merged.find(k);
         if (it == merged.end()) {
@@ -610,8 +597,8 @@ std::vector<std::pair<Key, Value>> Tree::scan(Key lo, Key hi) {
         }
       }
     }
-    auto abs = lc->absent_keys();
-    for (Key k : abs) {
+    auto abs_b = cb->absent_keys();
+    for (Key k : abs_b) {
       if (k >= lo && k <= hi) {
         auto it = merged.find(k);
         if (it == merged.end()) {
