@@ -663,12 +663,9 @@ LookupResult Tree::get(Key k) {
 
   thread_local std::mt19937_64 rng(std::random_device{}());
 
-  // Snapshot root_ to avoid TOCTOU across concurrent root splits.
-  // Old root nodes are never freed — stale pointers are safe to dereference.
   Node* root = root_;
 
   for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
-    // Re-snapshot root each iteration — root_ may have changed.
     root = root_;
     uint64_t v = root->version.load(std::memory_order_acquire);
     if (v & 1) {
@@ -679,53 +676,40 @@ LookupResult Tree::get(Key k) {
     Node* leaf = descend_to_leaf(k, versions);
     uint64_t leaf_v = versions.back().second;
 
-    // Step 2: cache lookup — top-down
-    // (a) root cache (present only when tree height == 2)
-    if (root->height >= 2 && root->cache_A) {
-      LookupResult pr = root->cache_A->lookup(k);
+    // Check cache_A first (hot cache, authority 0)
+    {
+      LookupResult pr = leaf->cache_A->lookup(k);
       if (pr.status == Status::Ok) {
         record_get_hit(true);
         return pr;
       }
-      if (root->cache_A->has_absent(k)) {
-        record_get_hit(true);
-        return {Status::NotFound};
-      }
-    }
-    // (b) leaf's parent cache (height-2 internal node) — needed when
-    //     tree height >= 3 (root has no cache).  scan() already checks
-    //     this; get() must do the same to stay consistent.
-    if (!root->cache_A && leaf->parent && leaf->parent->height == 2 &&
-        leaf->parent->cache_A) {
-      LookupResult pr = leaf->parent->cache_A->lookup(k);
-      if (pr.status == Status::Ok) {
-        record_get_hit(true);
-        return pr;
-      }
-      if (leaf->parent->cache_A->has_absent(k)) {
+      if (leaf->cache_A->has_absent(k)) {
         record_get_hit(true);
         return {Status::NotFound};
       }
     }
 
-    LookupResult r = leaf->cache_B->lookup(k);
-    if (r.status == Status::Ok) {
-      record_get_hit(true);
-      return r;
-    }
-    if (leaf->cache_B->has_absent(k)) {
-      record_get_hit(true);
-      return {Status::NotFound};
+    // Check cache_B (local cache, authority 1)
+    {
+      LookupResult r = leaf->cache_B->lookup(k);
+      if (r.status == Status::Ok) {
+        record_get_hit(true);
+        return r;
+      }
+      if (leaf->cache_B->has_absent(k)) {
+        record_get_hit(true);
+        return {Status::NotFound};
+      }
     }
 
-    // Step 2.5: check chunk chain (between leaf cache and SSD)
+    // Check chunk chains
     LookupResult cr = lookup_chunks(k);
     if (cr.status == Status::Ok) {
       record_get_hit(true);
       return cr;
     }
 
-    // Step 3: cache miss — try place placeholder
+    // Placeholder placement (in cache_B only)
     bool has_placed = false;
     int placeholder_idx = -1;
     if (p_placeholder_ >= 1.0) {
@@ -738,10 +722,10 @@ LookupResult Tree::get(Key k) {
       }
     }
 
-    // Step 4: query SSD
-    r = ssd_->get_record(leaf->page_id, k);
+    // Query SSD
+    LookupResult r = ssd_->get_record(leaf->page_id, k);
 
-    // Step 5: post-SSD cache recheck
+    // Post-SSD cache recheck (cache_B only)
     LookupResult r2 = leaf->cache_B->lookup(k);
     if (r2.status == Status::Ok) {
       if (has_placed) {
@@ -764,7 +748,7 @@ LookupResult Tree::get(Key k) {
       continue;
     }
 
-    // Step 6: fill placeholder based on SSD result
+    // Fill placeholder based on SSD result
     if (has_placed) {
       if (r.status == Status::Ok) {
         leaf->cache_B->fill_placeholder(placeholder_idx, r.value);
@@ -773,7 +757,7 @@ LookupResult Tree::get(Key k) {
       }
     }
 
-    // Step 7: version check after read
+    // Version check after read
     if (leaf->version.load(std::memory_order_acquire) == leaf_v) {
       record_get_hit(false);
       return r;
