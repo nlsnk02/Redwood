@@ -73,23 +73,23 @@ TEST_F(TreeBasicTest, EvictDirtyToSSD) {
 TEST(TreeMultiLevel, DebugTwoLeaves) {
   auto t = cbtree::Tree::DebugTwoLeaves("/tmp/test_ml.pages");
   EXPECT_EQ(t->debug_height(), 2);
-  // Parent cache exists and is initially empty
-  EXPECT_FALSE(t->debug_cache_a_contains(10));
+  // No parent cache — cache_A is on each leaf
+  EXPECT_TRUE(t->debug_all_leaves_have_cache());
+  EXPECT_TRUE(t->debug_height3_nodes_have_no_cache());
 }
 
-TEST(TreeMultiLevel, PutToParentCache) {
+TEST(TreeMultiLevel, PutToCacheA) {
   auto t = cbtree::Tree::DebugTwoLeaves("/tmp/test_ml.pages");
-  t->set_probabilities(1.0, 0.0);  // always go to cache_A (leaf-local in leaf-only design)
+  t->set_probabilities(1.0, 0.0);
   ASSERT_EQ(t->put(10, 1), cbtree::Status::Ok);
-  // Leaf-only cache: p_parent=1.0 puts data into leaf->cache_A
   EXPECT_TRUE(t->debug_cache_a_contains(10));
 }
 
-TEST(TreeMultiLevel, PutToLeafCache) {
+TEST(TreeMultiLevel, PutToCacheB) {
   auto t = cbtree::Tree::DebugTwoLeaves("/tmp/test_ml.pages");
-  t->set_probabilities(0.0, 0.0);  // never go to parent cache
+  t->set_probabilities(0.0, 0.0);
   ASSERT_EQ(t->put(10, 1), cbtree::Status::Ok);
-  // Parent cache should NOT have the key
+  // cache_A should NOT have the key
   EXPECT_FALSE(t->debug_cache_a_contains(10));
 }
 
@@ -103,23 +103,20 @@ TEST(TreeMultiLevel, DescendFindsCorrectLeaf) {
   EXPECT_EQ(t->get(50).value, 500u);
 }
 
-TEST(TreeMultiLevel, GetChecksParentCache) {
+TEST(TreeMultiLevel, GetChecksCacheA) {
   auto t = cbtree::Tree::DebugTwoLeaves("/tmp/test_ml.pages");
-  t->set_probabilities(1.0, 0.0);  // put into parent cache
+  t->set_probabilities(1.0, 0.0);
   ASSERT_EQ(t->put(42, 420), cbtree::Status::Ok);
-  // get should find it in parent cache
   auto r = t->get(42);
   EXPECT_EQ(r.status, cbtree::Status::Ok);
   EXPECT_EQ(r.value, 420u);
 }
 
-TEST(TreeMultiLevel, GetFromLeafCache) {
+TEST(TreeMultiLevel, GetFromCacheB) {
   auto t = cbtree::Tree::DebugTwoLeaves("/tmp/test_ml.pages");
-  t->set_probabilities(0.0, 0.0);  // put into leaf cache
+  t->set_probabilities(0.0, 0.0);
   ASSERT_EQ(t->put(7, 77), cbtree::Status::Ok);
-  // Not in parent cache
   EXPECT_FALSE(t->debug_cache_a_contains(7));
-  // Still findable via leaf
   auto r = t->get(7);
   EXPECT_EQ(r.status, cbtree::Status::Ok);
   EXPECT_EQ(r.value, 77u);

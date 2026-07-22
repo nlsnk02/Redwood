@@ -14,14 +14,14 @@ class TreeEvictTest : public ::testing::Test {
   std::string path_;
 };
 
-TEST_F(TreeEvictTest, ParentDemotesToLeaf) {
+TEST_F(TreeEvictTest, CacheADemotesToCacheB) {
   auto t = cbtree::Tree::DebugTwoLeaves(path_);
   t->set_probabilities(1.0, 0.0);
-  // Fill parent cache
+  // Fill cache_A via puts (p_parent=1.0 routes writes to cache_A)
   for (uint64_t i = 0; i < cbtree::kCacheSlots; ++i) {
     ASSERT_EQ(t->put(1000 + i, i), cbtree::Status::Ok);
   }
-  // One more put triggers parent->leaf demotion
+  // One more put triggers cache_A → cache_B demotion
   ASSERT_EQ(t->put(2000, 1), cbtree::Status::Ok);
   EXPECT_TRUE(t->debug_some_keys_in_leaf_cache());
 }
