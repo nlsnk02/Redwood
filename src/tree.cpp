@@ -842,44 +842,41 @@ Status Tree::debug_flush_all() {
       }
     }
 
-    // 2. Flush parent cache dirty entries to leaf caches, then evict.
-    if (root_->height >= 2 && root_->cache_A) {
-      if (root_->cache_A->occupied_count() > 0) any_entries = true;
-      std::vector<std::pair<Key, Value>> root_dirty;
-      root_->cache_A->flush_dirty(root_dirty);
-      for (const auto& [k, v] : root_dirty) {
-        Node* leaf = find_leaf_for_key(root_, k);
-        leaf->cache_B->upsert(k, v);
-      }
-      root_->cache_A->clear_clean_occupied();
+    // 2. Drain cache_A entries into cache_B, then evict to chunks.
+    for (Node* leaf : leaves) {
+      std::vector<std::pair<Key, Value>> a_dirty;
+      leaf->cache_A->flush_dirty(a_dirty);
+      if (!a_dirty.empty()) {
+        any_entries = true;
+        for (const auto& [k, v] : a_dirty) {
+          leaf->cache_B->upsert(k, v);
+        }
+        leaf->cache_A->clear_clean_occupied();
 
-      for (Node* leaf : leaves) {
+        // Evict cache_B entries just populated from cache_A
         std::lock_guard<std::mutex> lock(leaf->eviction_mutex);
         std::vector<std::pair<Key, Value>> dirty;
         leaf->cache_B->flush_dirty(dirty);
-        if (dirty.empty()) {
-          leaf->cache_B->clear_clean_occupied();
-          continue;
-        }
-        any_entries = true;
-        auto* chunk = new EvictChunk{};
-        chunk->page_id = leaf->page_id;
-        chunk->leaf = leaf;
-        chunk->num_entries = dirty.size();
-        for (size_t i = 0; i < dirty.size(); ++i) {
-          chunk->entries[i].key = dirty[i].first;
-          chunk->entries[i].value = dirty[i].second;
-          chunk->entries[i].fp = fingerprint(dirty[i].first);
-        }
-        EvictChunk* old_head = leaf->chunk_head_.load(std::memory_order_acquire);
-        do {
-          chunk->next.store(old_head, std::memory_order_release);
-        } while (!leaf->chunk_head_.compare_exchange_weak(old_head, chunk,
+        if (!dirty.empty()) {
+          auto* chunk = new EvictChunk{};
+          chunk->page_id = leaf->page_id;
+          chunk->leaf = leaf;
+          chunk->num_entries = dirty.size();
+          for (size_t i = 0; i < dirty.size(); ++i) {
+            chunk->entries[i].key = dirty[i].first;
+            chunk->entries[i].value = dirty[i].second;
+            chunk->entries[i].fp = fingerprint(dirty[i].first);
+          }
+          EvictChunk* old_head = leaf->chunk_head_.load(std::memory_order_acquire);
+          do {
+            chunk->next.store(old_head, std::memory_order_release);
+          } while (!leaf->chunk_head_.compare_exchange_weak(old_head, chunk,
                                                            std::memory_order_acq_rel));
-        leaf->chunk_count_.fetch_add(1, std::memory_order_relaxed);
+          leaf->chunk_count_.fetch_add(1, std::memory_order_relaxed);
 
-        for (const auto& [k, v] : dirty) {
-          leaf->cache_B->evict_clean_slot(k);
+          for (const auto& [k, v] : dirty) {
+            leaf->cache_B->evict_clean_slot(k);
+          }
         }
       }
     }
