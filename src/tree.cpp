@@ -1029,36 +1029,10 @@ void Tree::split_internal(Node* node) {
   size_t mid_idx = node->separators.size() / 2;
   Key mid = node->separators[mid_idx];
 
-  if (node->height >= 3 && node->cache_A) {
-    if (!node->cache_A->sorted_flag()) node->cache_A->sort_and_set_flag();
-    auto occ = node->cache_A->occupied_sorted();
-    for (const auto& [k, v] : occ) {
-      auto it = std::upper_bound(node->separators.begin(), node->separators.end(), k);
-      size_t child_idx = static_cast<size_t>(it - node->separators.begin());
-      Node* child = node->children[child_idx];
-      if (child->cache_A) {
-        child->cache_A->upsert(k, v);
-      }
-    }
-    auto abs = node->cache_A->absent_keys();
-    for (Key k : abs) {
-      auto it = std::upper_bound(node->separators.begin(), node->separators.end(), k);
-      size_t child_idx = static_cast<size_t>(it - node->separators.begin());
-      Node* child = node->children[child_idx];
-      if (child->cache_A) {
-        child->cache_A->mark_absent(k);
-      }
-    }
-    node->cache_A = nullptr;
-  }
-
   Node* new_node = new Node{};
   new_node->height = node->height;
   new_node->separators.reserve(kInternalFanout + 2);
   new_node->children.reserve(kInternalFanout + 2);
-  if (new_node->height == 2) {
-    new_node->cache_A = std::make_unique<CacheAttachment>();
-  }
 
   new_node->separators.assign(node->separators.begin() + static_cast<long>(mid_idx) + 1,
                               node->separators.end());
@@ -1071,10 +1045,6 @@ void Tree::split_internal(Node* node) {
 
   node->separators.resize(mid_idx);
   node->children.resize(mid_idx + 1);
-
-  if (node->height == 2 && node->cache_A) {
-    node->cache_A->split_into(mid, new_node->cache_A.get());
-  }
 
   // ---- B-link protocol ----
   // Link siblings BEFORE updating high_key bounds, so concurrent readers
@@ -1097,9 +1067,6 @@ void Tree::split_internal(Node* node) {
     new_root->height = node->height + 1;
     new_root->separators.reserve(kInternalFanout + 2);
     new_root->children.reserve(kInternalFanout + 2);
-    if (new_root->height < 3) {
-      new_root->cache_A = std::make_unique<CacheAttachment>();
-    }
     new_root->separators.push_back(mid);
     new_root->children.push_back(node);
     new_root->children.push_back(new_node);
