@@ -764,10 +764,15 @@ int Tree::debug_height() const {
 }
 
 bool Tree::debug_cache_a_contains(Key k) const {
-  if (root_->height < 2 || !root_->cache_A) return false;
-  LookupResult r = root_->cache_A->lookup(k);
-  if (r.status == Status::Ok) return true;
-  return root_->cache_A->has_absent(k);
+  std::vector<const Node*> leaves;
+  collect_leaves(root_, leaves);
+  for (const Node* leaf : leaves) {
+    if (!leaf->cache_A) continue;
+    LookupResult r = leaf->cache_A->lookup(k);
+    if (r.status == Status::Ok) return true;
+    if (leaf->cache_A->has_absent(k)) return true;
+  }
+  return false;
 }
 
 void Tree::collect_leaves(const Node* node, std::vector<const Node*>& leaves) {
@@ -1095,13 +1100,9 @@ bool Tree::debug_all_leaves_have_cache() const {
   std::vector<const Node*> leaves;
   collect_leaves(root_, leaves);
   for (const Node* leaf : leaves) {
-    if (!leaf->cache_B) return false;
+    if (!leaf->cache_A || !leaf->cache_B) return false;
   }
   return true;
-}
-
-bool Tree::debug_root_has_cache() const {
-  return root_->cache_A != nullptr;
 }
 
 bool Tree::debug_height3_nodes_have_no_cache() const {
@@ -1111,7 +1112,7 @@ bool Tree::debug_height3_nodes_have_no_cache() const {
     const Node* node = stack.back();
     stack.pop_back();
     if (!node) continue;
-    if (node->height >= 3 && (node->cache_A || node->cache_B)) return false;
+    if (node->height >= 2 && (node->cache_A || node->cache_B)) return false;
     for (Node* child : node->children) {
       stack.push_back(child);
     }
@@ -1126,7 +1127,6 @@ void Tree::debug_clear_all_caches() {
     if (leaf->cache_B) leaf->cache_B->clear();
     if (leaf->cache_A) leaf->cache_A->clear();
   }
-  if (root_->cache_A) root_->cache_A->clear();
 }
 
 bool Tree::debug_leaf_index_empty() const {
@@ -1213,7 +1213,6 @@ std::unique_ptr<Tree> Tree::DebugTwoLeaves(const std::string& ssd_path) {
 
   Node* root = new Node{};
   root->height = 2;
-  root->cache_A = std::make_unique<CacheAttachment>();
   root->separators.reserve(kInternalFanout + 2);
   root->children.reserve(kInternalFanout + 2);
   root->separators.push_back(50);

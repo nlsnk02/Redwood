@@ -38,7 +38,6 @@ class Tree {
   void set_probabilities(double p_parent, double p_placeholder);
   int debug_height() const;
   bool debug_cache_a_contains(Key k) const;
-  bool debug_root_has_cache() const;
   Status debug_flush_all();
   bool debug_all_leaves_have_cache() const;
 

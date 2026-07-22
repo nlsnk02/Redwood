@@ -40,10 +40,8 @@ TEST_F(TreeSplitTest, SplitPreservesCache) {
   // After split, all leaves and parent have caches
   EXPECT_GE(tree_->debug_height(), 2);
   EXPECT_TRUE(tree_->debug_all_leaves_have_cache());
-  // New root (if height==2) should NOT have cache (leaf-only cache design)
-  if (tree_->debug_height() == 2) {
-    EXPECT_FALSE(tree_->debug_root_has_cache());
-  }
+  // All internal nodes (height >= 2) should have no cache (leaf-only cache design)
+  EXPECT_TRUE(tree_->debug_height3_nodes_have_no_cache());
 }
 
 TEST_F(TreeSplitTest, InternalSplitReachesHeight3) {
