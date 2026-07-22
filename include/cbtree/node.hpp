@@ -37,8 +37,11 @@ struct Node {
   std::vector<Key> separators;        // separator keys
   std::vector<Node*> children;
 
-  // Cache (mounted when height == 1 or height == 2; nullptr for height >= 3)
-  std::unique_ptr<CacheAttachment> cache;
+  // Dual cache on leaf nodes (height == 1); both nullptr on internal nodes.
+  // cache_A: hot cache (former parent-cache semantics, authority 0)
+  // cache_B: local cache (former leaf-cache semantics, authority 1)
+  std::unique_ptr<CacheAttachment> cache_A;
+  std::unique_ptr<CacheAttachment> cache_B;
 
   // Per-leaf chunk chain: lock-free head for evicting threads.
   // Each leaf owns its own chain — no global CAS contention.
