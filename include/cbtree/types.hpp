@@ -9,7 +9,7 @@ using Value = uint64_t;
 using PageId = uint64_t;
 using Fingerprint = uint16_t;
 
-enum class SlotState : uint8_t { Empty, Placeholder, Occupied, Absent };
+enum class SlotState : uint8_t { Empty, Placeholder, Occupied, Absent, Tombstone };
 
 enum class Status : uint8_t {
   Ok,
@@ -23,6 +23,8 @@ enum class Status : uint8_t {
 struct LookupResult {
   Status status{Status::NotFound};
   Value value{};
+  int placeholder_idx = -1;  // >=0 if a Placeholder slot was found for this key
+  bool absent = false;       // true if an Absent slot was found for this key
 };
 
 // MemoryHitStats tracks cache/memory hit rate for get() operations.
@@ -41,7 +43,7 @@ inline constexpr int kInternalFanout = 32;
 inline constexpr size_t kPageSize = 4096;
 inline constexpr double kParentFillThreshold = 0.8;
 inline constexpr double kLeafFillThreshold = 0.8;
-inline constexpr double kDefaultPParent = 0.1;
-inline constexpr double kDefaultPPlaceholder = 0.4;
+inline constexpr double kDefaultPParent = 0.23;
+inline constexpr double kDefaultPPlaceholder = 1.0;
 
 }  // namespace cbtree

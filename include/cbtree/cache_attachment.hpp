@@ -22,7 +22,9 @@ struct CacheSlot {
 
 class CacheAttachment {
  public:
-  Status upsert(Key k, Value v);
+  // When known_new=true, skip the existing-key scan — caller guarantees
+  // key is not present, so we probe for the first Empty/Tombstone directly.
+  Status upsert(Key k, Value v, bool known_new = false);
   LookupResult lookup(Key k);
   bool has_absent(Key k) const;
   Status mark_absent(Key k);
@@ -69,11 +71,16 @@ class CacheAttachment {
 
   KeyLockTable& key_locks() { return key_locks_; }
 
+  // Compact all entries to remove tombstones — O(64), called rarely.
+  void rehash();
+  void maybe_rehash();
+
  private:
   CacheSlot slots_[kCacheSlots];
   std::atomic<size_t> hand_{0};
   std::atomic<bool> sorted_flag_{false};
   KeyLockTable key_locks_;
+  std::atomic<int> tombstone_count_{0};
 };
 
 }  // namespace cbtree

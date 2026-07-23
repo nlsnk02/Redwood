@@ -4,70 +4,159 @@
 
 namespace cbtree {
 
-Status CacheAttachment::upsert(Key k, Value v) {
+// ---- Open-addressing helpers ----
+
+// Probe chain: starting from fp % kCacheSlots, scan forward linearly.
+// Empty   → terminates the chain (key not present)
+// Tombstone → skipped but remembered as first candidate for insertion
+// Occupied / Placeholder / Absent → check fp+key; if match, it's the target
+
+Status CacheAttachment::upsert(Key k, Value v, bool known_new) {
   KeyLockGuard key_guard(key_locks_, k);
   Fingerprint fp = fingerprint(k);
+  size_t start = fp % kCacheSlots;
 
-  // Search for existing slot with matching key (Occupied, Absent, Placeholder)
-  for (int i = 0; i < kCacheSlots; ++i) {
-    std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
-    if (slots_[i].state == SlotState::Empty) continue;
-    if (slots_[i].fp != fp) continue;
-    if (slots_[i].key != k) continue;
+  int first_free = -1;  // first Tombstone or (end-of-chain) Empty
 
-    // Found existing slot -- update in-place
-    slots_[i].value = v;
-    slots_[i].state = SlotState::Occupied;
-    slots_[i].dirty = true;
-    slots_[i].clock_bit.store(true, std::memory_order_release);
+  for (size_t i = 0; i < kCacheSlots; ++i) {
+    size_t idx = (start + i) % kCacheSlots;
+    std::lock_guard<std::mutex> lock(slots_[idx].slot_mutex);
+    SlotState st = slots_[idx].state;
+
+    if (st == SlotState::Empty) {
+      if (known_new) {
+        // Caller guarantees key not present — claim Empty immediately.
+        slots_[idx].fp = fp;
+        slots_[idx].key = k;
+        slots_[idx].value = v;
+        slots_[idx].state = SlotState::Occupied;
+        slots_[idx].dirty = true;
+        slots_[idx].clock_bit.store(true, std::memory_order_release);
+        slots_[idx].generation.fetch_add(1, std::memory_order_relaxed);
+        return Status::Ok;
+      }
+      if (first_free < 0) first_free = static_cast<int>(idx);
+      break;  // end of probe chain — key not present
+    }
+
+    if (st == SlotState::Tombstone) {
+      if (known_new) {
+        // Recycle tombstone immediately.
+        tombstone_count_.fetch_sub(1, std::memory_order_relaxed);
+        slots_[idx].fp = fp;
+        slots_[idx].key = k;
+        slots_[idx].value = v;
+        slots_[idx].state = SlotState::Occupied;
+        slots_[idx].dirty = true;
+        slots_[idx].clock_bit.store(true, std::memory_order_release);
+        slots_[idx].generation.fetch_add(1, std::memory_order_relaxed);
+        return Status::Ok;
+      }
+      if (first_free < 0) first_free = static_cast<int>(idx);
+      continue;  // keep probing — key may still be further along
+    }
+
+    if (known_new) continue;  // skip existing-key check
+
+    // st is Occupied, Placeholder, or Absent
+    if (slots_[idx].fp != fp) continue;
+    if (slots_[idx].key != k) continue;
+
+    // Found existing entry for this key — update in-place
+    slots_[idx].value = v;
+    slots_[idx].state = SlotState::Occupied;
+    slots_[idx].dirty = true;
+    slots_[idx].clock_bit.store(true, std::memory_order_release);
     return Status::Ok;
   }
 
-  // No existing slot -- find an empty one and claim it
-  for (int i = 0; i < kCacheSlots; ++i) {
-    std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
-    if (slots_[i].state == SlotState::Empty) {
-      slots_[i].fp = fp;
-      slots_[i].key = k;
-      slots_[i].value = v;
-      slots_[i].state = SlotState::Occupied;
-      slots_[i].dirty = true;
-      slots_[i].clock_bit.store(true, std::memory_order_release);
-      slots_[i].generation.fetch_add(1, std::memory_order_relaxed);
-      return Status::Ok;
+  if (known_new) return Status::Full;
+
+  // Key not found — claim first available slot (tombstone or end-of-chain empty)
+  if (first_free < 0) return Status::Full;
+
+  {
+    std::lock_guard<std::mutex> lock(slots_[first_free].slot_mutex);
+    SlotState st = slots_[first_free].state;
+    if (st == SlotState::Empty || st == SlotState::Tombstone) {
+      if (st == SlotState::Tombstone) {
+        tombstone_count_.fetch_sub(1, std::memory_order_relaxed);
+      }
+      slots_[first_free].fp = fp;
+      slots_[first_free].key = k;
+      slots_[first_free].value = v;
+      slots_[first_free].state = SlotState::Occupied;
+      slots_[first_free].dirty = true;
+      slots_[first_free].clock_bit.store(true, std::memory_order_release);
+      slots_[first_free].generation.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      // Slot was taken by another thread's key — rare race, caller retries.
+      return Status::Full;
     }
   }
-
-  return Status::Full;
+  return Status::Ok;
 }
 
 LookupResult CacheAttachment::lookup(Key k) {
   Fingerprint fp = fingerprint(k);
-  for (int i = 0; i < kCacheSlots; ++i) {
-    std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
-    SlotState st = slots_[i].state;
-    if (st == SlotState::Empty) continue;
-    if (slots_[i].fp != fp) continue;
-    if (slots_[i].key != k) continue;
+  size_t start = fp % kCacheSlots;
 
-    if (st == SlotState::Occupied) {
-      slots_[i].clock_bit.store(true, std::memory_order_release);
-      return {Status::Ok, slots_[i].value};
+  for (size_t i = 0; i < kCacheSlots; ++i) {
+    size_t idx = (start + i) % kCacheSlots;
+    std::lock_guard<std::mutex> lock(slots_[idx].slot_mutex);
+    SlotState st = slots_[idx].state;
+
+    if (st == SlotState::Empty) {
+      // End of probe chain — key not in this cache
+      break;
     }
-    // Placeholder or Absent -- not a hit
-    return {Status::NotFound};
+
+    if (st == SlotState::Tombstone) continue;
+
+    // st is Occupied, Placeholder, or Absent
+    if (slots_[idx].fp != fp) continue;
+    if (slots_[idx].key != k) continue;
+
+    // Found the key
+    if (st == SlotState::Occupied) {
+      slots_[idx].clock_bit.store(true, std::memory_order_release);
+      return {Status::Ok, slots_[idx].value};
+    }
+    if (st == SlotState::Placeholder) {
+      LookupResult r{Status::NotFound};
+      r.placeholder_idx = static_cast<int>(idx);
+      return r;
+    }
+    // Absent
+    LookupResult r{Status::NotFound};
+    r.absent = true;
+    return r;
   }
+
   return {Status::NotFound};
 }
 
 bool CacheAttachment::has_absent(Key k) const {
   Fingerprint fp = fingerprint(k);
-  for (int i = 0; i < kCacheSlots; ++i) {
-    std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
-    SlotState st = slots_[i].state;
-    if (st != SlotState::Absent) continue;
-    if (slots_[i].fp != fp) continue;
-    if (slots_[i].key == k) return true;
+  size_t start = fp % kCacheSlots;
+
+  for (size_t i = 0; i < kCacheSlots; ++i) {
+    size_t idx = (start + i) % kCacheSlots;
+    std::lock_guard<std::mutex> lock(slots_[idx].slot_mutex);
+    SlotState st = slots_[idx].state;
+
+    if (st == SlotState::Empty) break;
+    if (st == SlotState::Tombstone) continue;
+    if (st != SlotState::Absent) {
+      if (slots_[idx].fp != fp) continue;
+      if (slots_[idx].key != k) continue;
+    }
+    // Only return true for Absent with matching fp+key
+    if (slots_[idx].fp != fp) continue;
+    if (slots_[idx].key != k) continue;
+    if (st == SlotState::Absent) return true;
+    // Occupied or Placeholder — still the same key, but not absent
+    break;
   }
   return false;
 }
@@ -75,64 +164,109 @@ bool CacheAttachment::has_absent(Key k) const {
 Status CacheAttachment::mark_absent(Key k) {
   KeyLockGuard key_guard(key_locks_, k);
   Fingerprint fp = fingerprint(k);
+  size_t start = fp % kCacheSlots;
 
-  // Check if key already exists in any slot
-  for (int i = 0; i < kCacheSlots; ++i) {
-    std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
-    if (slots_[i].state == SlotState::Empty) continue;
-    if (slots_[i].fp != fp) continue;
-    if (slots_[i].key != k) continue;
+  int first_free = -1;
 
-    // Found -- mark as absent
-    slots_[i].state = SlotState::Absent;
-    slots_[i].dirty = true;
+  for (size_t i = 0; i < kCacheSlots; ++i) {
+    size_t idx = (start + i) % kCacheSlots;
+    std::lock_guard<std::mutex> lock(slots_[idx].slot_mutex);
+    SlotState st = slots_[idx].state;
+
+    if (st == SlotState::Empty) {
+      if (first_free < 0) first_free = static_cast<int>(idx);
+      break;
+    }
+
+    if (st == SlotState::Tombstone) {
+      if (first_free < 0) first_free = static_cast<int>(idx);
+      continue;
+    }
+
+    if (slots_[idx].fp != fp) continue;
+    if (slots_[idx].key != k) continue;
+
+    // Found existing entry — mark as Absent
+    slots_[idx].state = SlotState::Absent;
+    slots_[idx].dirty = true;
     return Status::Ok;
   }
 
-  // Key not present -- insert as absent
-  for (int i = 0; i < kCacheSlots; ++i) {
-    std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
-    if (slots_[i].state == SlotState::Empty) {
-      slots_[i].fp = fp;
-      slots_[i].key = k;
-      slots_[i].state = SlotState::Absent;
-      slots_[i].dirty = true;
-      slots_[i].generation.fetch_add(1, std::memory_order_relaxed);
+  // Key not present — insert as Absent
+  if (first_free < 0) return Status::Full;
+
+  {
+    std::lock_guard<std::mutex> lock(slots_[first_free].slot_mutex);
+    SlotState st = slots_[first_free].state;
+    if (st == SlotState::Empty || st == SlotState::Tombstone) {
+      if (st == SlotState::Tombstone) {
+        tombstone_count_.fetch_sub(1, std::memory_order_relaxed);
+      }
+      slots_[first_free].fp = fp;
+      slots_[first_free].key = k;
+      slots_[first_free].state = SlotState::Absent;
+      slots_[first_free].dirty = true;
+      slots_[first_free].generation.fetch_add(1, std::memory_order_relaxed);
       return Status::Ok;
     }
   }
-
   return Status::Full;
 }
 
 Status CacheAttachment::try_place_placeholder(Key k, int* out_idx) {
   KeyLockGuard key_guard(key_locks_, k);
   Fingerprint fp = fingerprint(k);
+  size_t start = fp % kCacheSlots;
 
-  // Check if placeholder already exists for this key
-  for (int i = 0; i < kCacheSlots; ++i) {
-    std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
-    if (slots_[i].state != SlotState::Placeholder) continue;
-    if (slots_[i].fp != fp) continue;
-    if (slots_[i].key == k) {
-      if (out_idx) *out_idx = i;
+  int first_free = -1;
+
+  for (size_t i = 0; i < kCacheSlots; ++i) {
+    size_t idx = (start + i) % kCacheSlots;
+    std::lock_guard<std::mutex> lock(slots_[idx].slot_mutex);
+    SlotState st = slots_[idx].state;
+
+    if (st == SlotState::Empty) {
+      if (first_free < 0) first_free = static_cast<int>(idx);
+      break;
+    }
+
+    if (st == SlotState::Tombstone) {
+      if (first_free < 0) first_free = static_cast<int>(idx);
+      continue;
+    }
+
+    // Check if this entry matches our key
+    if (slots_[idx].fp != fp) continue;
+    if (slots_[idx].key != k) continue;
+
+    if (st == SlotState::Placeholder) {
+      // Placeholder already exists for this key
+      if (out_idx) *out_idx = static_cast<int>(idx);
+      return Status::Ok;
+    }
+    // Key already exists as Occupied or Absent — no placeholder needed
+    if (out_idx) *out_idx = -1;
+    return Status::Ok;
+  }
+
+  // Key not found — create placeholder
+  if (first_free < 0) return Status::Full;
+
+  {
+    std::lock_guard<std::mutex> lock(slots_[first_free].slot_mutex);
+    SlotState st = slots_[first_free].state;
+    if (st == SlotState::Empty || st == SlotState::Tombstone) {
+      if (st == SlotState::Tombstone) {
+        tombstone_count_.fetch_sub(1, std::memory_order_relaxed);
+      }
+      slots_[first_free].fp = fp;
+      slots_[first_free].key = k;
+      slots_[first_free].state = SlotState::Placeholder;
+      slots_[first_free].generation.fetch_add(1, std::memory_order_relaxed);
+      if (out_idx) *out_idx = static_cast<int>(first_free);
       return Status::Ok;
     }
   }
-
-  // Find empty slot and claim it
-  for (int i = 0; i < kCacheSlots; ++i) {
-    std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
-    if (slots_[i].state == SlotState::Empty) {
-      slots_[i].fp = fp;
-      slots_[i].key = k;
-      slots_[i].state = SlotState::Placeholder;
-      slots_[i].generation.fetch_add(1, std::memory_order_relaxed);
-      if (out_idx) *out_idx = i;
-      return Status::Ok;
-    }
-  }
-
   return Status::Full;
 }
 
@@ -204,11 +338,12 @@ Status CacheAttachment::pick_clock_victim(Key* out_key, Value* out_val,
   for (int round = 0; round < 2 * kCacheSlots; ++round) {
     size_t idx = hand_.fetch_add(1, std::memory_order_relaxed) % kCacheSlots;
 
-    // Lock slot to safely read state
     {
       std::lock_guard<std::mutex> lock(slots_[idx].slot_mutex);
       SlotState st = slots_[idx].state;
-      if (st == SlotState::Empty || st == SlotState::Placeholder) continue;
+      if (st == SlotState::Empty || st == SlotState::Placeholder ||
+          st == SlotState::Tombstone)
+        continue;
 
       // OCCUPIED or ABSENT -- check clock bit
       bool bit = slots_[idx].clock_bit.load(std::memory_order_acquire);
@@ -232,13 +367,14 @@ Status CacheAttachment::pick_clock_victim(Key* out_key, Value* out_val,
       *out_key = slots_[idx].key;
       *out_val = slots_[idx].value;
       *out_dirty = slots_[idx].dirty;
-      slots_[idx].state = SlotState::Empty;
+      slots_[idx].state = SlotState::Tombstone;
+      tombstone_count_.fetch_add(1, std::memory_order_relaxed);
       slots_[idx].clock_bit.store(false, std::memory_order_release);
     }
     return Status::Ok;
   }
 
-  // Fallback: all non-empty slots are PLACEHOLDERs -- evict the first one
+  // Fallback: all non-empty/non-tombstone slots are PLACEHOLDERs — evict the first one
   for (int i = 0; i < kCacheSlots; ++i) {
     std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
     if (slots_[i].state != SlotState::Placeholder) continue;
@@ -246,7 +382,8 @@ Status CacheAttachment::pick_clock_victim(Key* out_key, Value* out_val,
     *out_key = slots_[i].key;
     *out_val = 0;
     *out_dirty = false;
-    slots_[i].state = SlotState::Empty;
+    slots_[i].state = SlotState::Tombstone;
+    tombstone_count_.fetch_add(1, std::memory_order_relaxed);
     return Status::Ok;
   }
 
@@ -264,7 +401,9 @@ Status CacheAttachment::find_clock_victim(Key* out_key, Value* out_val,
     {
       std::lock_guard<std::mutex> lock(slots_[idx].slot_mutex);
       SlotState st = slots_[idx].state;
-      if (st == SlotState::Empty || st == SlotState::Placeholder) continue;
+      if (st == SlotState::Empty || st == SlotState::Placeholder ||
+          st == SlotState::Tombstone)
+        continue;
 
       // OCCUPIED or ABSENT -- check clock bit
       bool bit = slots_[idx].clock_bit.load(std::memory_order_acquire);
@@ -292,7 +431,7 @@ Status CacheAttachment::find_clock_victim(Key* out_key, Value* out_val,
     return Status::Ok;
   }
 
-  // Fallback: all non-empty slots are PLACEHOLDERs
+  // Fallback: all non-empty/non-tombstone slots are PLACEHOLDERs
   for (int i = 0; i < kCacheSlots; ++i) {
     std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
     if (slots_[i].state != SlotState::Placeholder) continue;
@@ -316,11 +455,12 @@ bool CacheAttachment::evict_slot(int idx, Key expected_key, uint32_t expected_ge
   if (slots_[idx].key != expected_key) return false;
   if (slots_[idx].generation.load(std::memory_order_acquire) != expected_gen)
     return false;
-  // Allow clearing Occupied, Absent, and Placeholder states (C1 fix).
+  // Allow clearing Occupied, Absent, and Placeholder states.
   if (slots_[idx].state != SlotState::Occupied &&
       slots_[idx].state != SlotState::Absent &&
       slots_[idx].state != SlotState::Placeholder) return false;
-  slots_[idx].state = SlotState::Empty;
+  slots_[idx].state = SlotState::Tombstone;
+  tombstone_count_.fetch_add(1, std::memory_order_relaxed);
   slots_[idx].clock_bit.store(false, std::memory_order_release);
   return true;
 }
@@ -328,37 +468,53 @@ bool CacheAttachment::evict_slot(int idx, Key expected_key, uint32_t expected_ge
 Status CacheAttachment::split_into(Key mid, CacheAttachment* right) {
   if (!right) return Status::Error;
 
+  // Collect all valid entries from this cache.
+  struct Entry {
+    Key key;
+    Value value;
+    SlotState state;
+    bool dirty;
+    Fingerprint fp;
+  };
+  std::vector<Entry> entries;
   for (int i = 0; i < kCacheSlots; ++i) {
     std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
-    if (slots_[i].state == SlotState::Empty) continue;
-    if (slots_[i].key < mid) continue;
+    SlotState st = slots_[i].state;
+    if (st == SlotState::Occupied || st == SlotState::Placeholder ||
+        st == SlotState::Absent) {
+      entries.push_back(
+          {slots_[i].key, slots_[i].value, st, slots_[i].dirty, slots_[i].fp});
+    }
+  }
 
-    // Find an empty slot in the right cache
-    int right_empty = -1;
-    for (int j = 0; j < kCacheSlots; ++j) {
-      std::lock_guard<std::mutex> rlock(right->slots_[j].slot_mutex);
-      if (right->slots_[j].state == SlotState::Empty) {
-        right_empty = j;
+  // Clear both caches (resets to Empty, zero tombstones).
+  clear();
+  right->clear();
+
+  // Re-insert into appropriate cache using open addressing.
+  for (const auto& e : entries) {
+    CacheAttachment* target = (e.key < mid) ? this : right;
+    Fingerprint fp = e.fp;
+    size_t start = fp % kCacheSlots;
+    bool placed = false;
+    for (size_t i = 0; i < kCacheSlots; ++i) {
+      size_t idx = (start + i) % kCacheSlots;
+      std::lock_guard<std::mutex> lock(target->slots_[idx].slot_mutex);
+      if (target->slots_[idx].state == SlotState::Empty) {
+        target->slots_[idx].fp = fp;
+        target->slots_[idx].key = e.key;
+        target->slots_[idx].value = e.value;
+        target->slots_[idx].state = e.state;
+        target->slots_[idx].dirty = e.dirty;
+        target->slots_[idx].clock_bit.store(false, std::memory_order_release);
+        placed = true;
         break;
       }
     }
-    if (right_empty < 0) return Status::Full;
-
-    // Copy slot contents to right (mutex is not copyable)
-    {
-      std::lock_guard<std::mutex> rlock(right->slots_[right_empty].slot_mutex);
-      right->slots_[right_empty].state = slots_[i].state;
-      right->slots_[right_empty].key = slots_[i].key;
-      right->slots_[right_empty].value = slots_[i].value;
-      right->slots_[right_empty].fp = slots_[i].fp;
-      right->slots_[right_empty].dirty = slots_[i].dirty;
-      right->slots_[right_empty].clock_bit.store(false,
-                                                  std::memory_order_release);
+    if (!placed) {
+      // This shouldn't happen — both caches are empty after clear().
+      return Status::Full;
     }
-
-    // Clear the left slot
-    slots_[i].state = SlotState::Empty;
-    slots_[i].clock_bit.store(false, std::memory_order_release);
   }
 
   clear_sorted_flag();
@@ -378,15 +534,22 @@ void CacheAttachment::flush_dirty(std::vector<std::pair<Key, Value>>& out) {
 
 bool CacheAttachment::evict_clean_slot(Key k) {
   Fingerprint fp = fingerprint(k);
-  for (int i = 0; i < kCacheSlots; ++i) {
-    std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
-    if (slots_[i].state != SlotState::Occupied) continue;
-    if (slots_[i].fp != fp) continue;
-    if (slots_[i].key != k) continue;
+  size_t start = fp % kCacheSlots;
+  for (size_t i = 0; i < kCacheSlots; ++i) {
+    size_t idx = (start + i) % kCacheSlots;
+    std::lock_guard<std::mutex> lock(slots_[idx].slot_mutex);
+    SlotState st = slots_[idx].state;
+
+    if (st == SlotState::Empty) return false;  // end of chain, key not found
+    if (st == SlotState::Tombstone) continue;
+    if (st != SlotState::Occupied) continue;
+    if (slots_[idx].fp != fp) continue;
+    if (slots_[idx].key != k) continue;
     // Only clear if clean — another thread may have re-dirtied it.
-    if (slots_[i].dirty) return false;
-    slots_[i].state = SlotState::Empty;
-    slots_[i].clock_bit.store(false, std::memory_order_release);
+    if (slots_[idx].dirty) return false;
+    slots_[idx].state = SlotState::Tombstone;
+    tombstone_count_.fetch_add(1, std::memory_order_relaxed);
+    slots_[idx].clock_bit.store(false, std::memory_order_release);
     return true;
   }
   return false;
@@ -396,7 +559,8 @@ void CacheAttachment::clear_clean_occupied() {
   for (int i = 0; i < kCacheSlots; ++i) {
     std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
     if (slots_[i].state == SlotState::Occupied && !slots_[i].dirty) {
-      slots_[i].state = SlotState::Empty;
+      slots_[i].state = SlotState::Tombstone;
+      tombstone_count_.fetch_add(1, std::memory_order_relaxed);
       slots_[i].clock_bit.store(false, std::memory_order_release);
     }
   }
@@ -408,6 +572,7 @@ void CacheAttachment::clear() {
     slots_[i].state = SlotState::Empty;
     slots_[i].clock_bit.store(false, std::memory_order_release);
   }
+  tombstone_count_.store(0, std::memory_order_relaxed);
 }
 
 std::vector<std::pair<Key, Value>> CacheAttachment::occupied_sorted() {
@@ -423,46 +588,9 @@ std::vector<std::pair<Key, Value>> CacheAttachment::occupied_sorted() {
 }
 
 void CacheAttachment::sort_and_set_flag() {
-  // Collect all Occupied and Absent entries with their metadata
-  struct SlotData {
-    Key key;
-    Value value;
-    SlotState state;
-    bool dirty;
-    Fingerprint fp;
-  };
-  std::vector<SlotData> entries;
-  for (int i = 0; i < kCacheSlots; ++i) {
-    std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
-    SlotState st = slots_[i].state;
-    if (st == SlotState::Occupied || st == SlotState::Absent) {
-      entries.push_back({slots_[i].key, slots_[i].value, st, slots_[i].dirty,
-                         slots_[i].fp});
-    }
-  }
-
-  // Sort by key
-  std::sort(entries.begin(), entries.end(),
-            [](const SlotData& a, const SlotData& b) { return a.key < b.key; });
-
-  // Rearrange: sorted entries first, then empty slots
-  size_t pos = 0;
-  for (const auto& e : entries) {
-    std::lock_guard<std::mutex> lock(slots_[pos].slot_mutex);
-    slots_[pos].key = e.key;
-    slots_[pos].value = e.value;
-    slots_[pos].state = e.state;
-    slots_[pos].dirty = e.dirty;
-    slots_[pos].fp = e.fp;
-    slots_[pos].clock_bit.store(false, std::memory_order_release);
-    ++pos;
-  }
-  for (; pos < kCacheSlots; ++pos) {
-    std::lock_guard<std::mutex> lock(slots_[pos].slot_mutex);
-    slots_[pos].state = SlotState::Empty;
-    slots_[pos].clock_bit.store(false, std::memory_order_release);
-  }
-
+  // Open addressing: entries are at probe-determined positions, not key order.
+  // occupied_sorted() always does a full scan + sort, so this is a no-op
+  // that simply marks the flag to avoid future calls.
   set_sorted_flag(true);
 }
 
@@ -476,6 +604,66 @@ std::vector<Key> CacheAttachment::absent_keys() const {
   }
   std::sort(result.begin(), result.end());
   return result;
+}
+
+void CacheAttachment::rehash() {
+  // Collect all live entries (Occupied, Placeholder, Absent).
+  struct Entry {
+    Key key;
+    Value value;
+    SlotState state;
+    bool dirty;
+    Fingerprint fp;
+  };
+  std::vector<Entry> entries;
+  for (int i = 0; i < kCacheSlots; ++i) {
+    std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
+    SlotState st = slots_[i].state;
+    if (st == SlotState::Occupied || st == SlotState::Placeholder ||
+        st == SlotState::Absent) {
+      entries.push_back(
+          {slots_[i].key, slots_[i].value, st, slots_[i].dirty, slots_[i].fp});
+    }
+  }
+
+  // Clear all slots to Empty, reset tombstones.
+  for (int i = 0; i < kCacheSlots; ++i) {
+    std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
+    slots_[i].state = SlotState::Empty;
+    slots_[i].clock_bit.store(false, std::memory_order_release);
+  }
+  tombstone_count_.store(0, std::memory_order_relaxed);
+
+  // Re-insert using open addressing.
+  for (const auto& e : entries) {
+    size_t start = e.fp % kCacheSlots;
+    for (size_t i = 0; i < kCacheSlots; ++i) {
+      size_t idx = (start + i) % kCacheSlots;
+      std::lock_guard<std::mutex> lock(slots_[idx].slot_mutex);
+      if (slots_[idx].state == SlotState::Empty) {
+        slots_[idx].fp = e.fp;
+        slots_[idx].key = e.key;
+        slots_[idx].value = e.value;
+        slots_[idx].state = e.state;
+        slots_[idx].dirty = e.dirty;
+        slots_[idx].clock_bit.store(false, std::memory_order_release);
+        break;
+      }
+    }
+    // If we can't re-insert, the cache is logically full — shouldn't happen
+    // since we're inserting the same number of entries we collected.
+  }
+}
+
+void CacheAttachment::maybe_rehash() {
+  // Automatic rehash is intentionally disabled.
+  // Tombstones are naturally recycled by insertions (upsert/upsert_new
+  // reclaim the first Tombstone in the probe chain).  Rehash remains
+  // available as a public method for explicit maintenance calls.
+  //
+  // Reasoning: rehash clears all slots and rebuilds, which creates a
+  // window where concurrent lookups see all-Empty slots and miss live
+  // entries.  Natural tombstone recycling avoids this race entirely.
 }
 
 }  // namespace cbtree

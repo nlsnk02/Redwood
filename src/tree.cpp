@@ -467,8 +467,18 @@ Status Tree::put(Key k, Value v) {
     // Phase 1: try cache_A (hot cache, former parent semantics)
     {
       LookupResult lr = leaf->cache_A->lookup(k);
-      bool exists_in_A =
-          (lr.status == Status::Ok) || leaf->cache_A->has_absent(k);
+
+      // Placeholder found — fill it unconditionally
+      if (lr.placeholder_idx >= 0) {
+        Status s = leaf->cache_A->upsert(k, v);
+        if (s == Status::Ok) {
+          if (leaf->version.load(std::memory_order_acquire) != leaf_v) continue;
+          evict_cache_A_if_needed(leaf);
+          return Status::Ok;
+        }
+      }
+
+      bool exists_in_A = (lr.status == Status::Ok) || lr.absent;
 
       if (exists_in_A) {
         Status s = leaf->cache_A->upsert(k, v);
@@ -486,7 +496,7 @@ Status Tree::put(Key k, Value v) {
         }
 
         if (use_A) {
-          Status s = leaf->cache_A->upsert(k, v);
+          Status s = leaf->cache_A->upsert(k, v, true);
           if (s == Status::Ok) {
             if (leaf->version.load(std::memory_order_acquire) != leaf_v) continue;
             evict_cache_A_if_needed(leaf);
@@ -497,24 +507,23 @@ Status Tree::put(Key k, Value v) {
     }
 
     // Phase 2: upsert into cache_B (local cache)
-    Status s = leaf->cache_B->upsert(k, v);
-    if (s == Status::Ok) {
-      if (leaf->version.load(std::memory_order_acquire) != leaf_v) continue;
-      evict_leaf_if_needed(leaf);
-      return Status::Ok;
-    }
-
-    if (s != Status::Full) return s;
-
-    // cache_B full — evict to make room
-    Status evict_s = evict_to_chunk(leaf);
-    if (evict_s == Status::Retry) {
-      std::this_thread::yield();
+    {
+      Status s = leaf->cache_B->upsert(k, v);
+      if (s == Status::Ok) {
+        if (leaf->version.load(std::memory_order_acquire) != leaf_v) continue;
+        evict_leaf_if_needed(leaf);
+        return Status::Ok;
+      }
+      if (s != Status::Full) return s;
+      Status evict_s = evict_to_chunk(leaf);
+      if (evict_s == Status::Retry) {
+        std::this_thread::yield();
+        continue;
+      }
+      if (evict_s != Status::Ok) return Status::Full;
+      leaf = descend_to_leaf(k, versions);
       continue;
     }
-    if (evict_s != Status::Ok) return Status::Full;
-
-    leaf = descend_to_leaf(k, versions);
   }
   return Status::Full;
 }
@@ -670,7 +679,7 @@ LookupResult Tree::get(Key k) {
         record_get_hit(true);
         return pr;
       }
-      if (leaf->cache_A->has_absent(k)) {
+      if (pr.absent) {
         record_get_hit(true);
         return {Status::NotFound};
       }
@@ -683,7 +692,7 @@ LookupResult Tree::get(Key k) {
         record_get_hit(true);
         return r;
       }
-      if (leaf->cache_B->has_absent(k)) {
+      if (r.absent) {
         record_get_hit(true);
         return {Status::NotFound};
       }
