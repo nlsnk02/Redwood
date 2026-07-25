@@ -151,6 +151,12 @@ Status Tree::evict_to_chunk(Node* leaf) {
                                                        std::memory_order_acq_rel));
   }
   leaf->chunk_count_.fetch_add(1, std::memory_order_relaxed);
+  {
+    size_t t = total_chunk_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    size_t p = peak_chunk_count_.load(std::memory_order_relaxed);
+    while (t > p && !peak_chunk_count_.compare_exchange_weak(p, t,
+        std::memory_order_relaxed)) {}
+  }
 
   // 4. Clear cache slots for entries now in the chunk.
   //    Only clears slots that are still clean (not re-dirtied by another
@@ -159,16 +165,10 @@ Status Tree::evict_to_chunk(Node* leaf) {
     leaf->cache_B->evict_clean_slot(k);
   }
 
-  // 5. RELEASE eviction_mutex BEFORE flushing to SSD.
-  //    The critical section (step 1-4) is ~microseconds.
-  //    SSD I/O (~37ms fsync in sync mode) happens entirely outside the lock.
-  //    Readers that miss in cache will find the data in the chunk chain.
+  // 5. RELEASE eviction_mutex — chunk is on the chain, visible to readers.
+  //    Flush is DEFERRED: when total_chunk_count_ >= flush_batch_threshold_,
+  //    the next put() that modifies cache_B will proactively flush one leaf's chunks.
   evict_lock.unlock();
-
-  // 6. Flush THIS leaf's chunks to SSD. Uses leaf->flush_mutex_ (try_lock)
-  //    so only one thread flushes a given leaf at a time. Different leaves
-  //    flush independently.
-  flush_leaf(leaf);
 
   return Status::Ok;
 }
@@ -191,6 +191,11 @@ Status Tree::evict_cache_A_if_needed(Node* leaf) {
     if (leaf->cache_B) {
       evict_leaf_if_needed(leaf);  // ensure cache_B has room
       leaf->cache_B->upsert(victim_key, victim_val);
+      // Deferred batch flush: modified cache_B via demotion.
+      if (total_chunk_count_.load(std::memory_order_acquire) >=
+          static_cast<size_t>(flush_batch_threshold_)) {
+        flush_leaf(leaf);
+      }
     }
   }
   leaf->cache_A->evict_slot(victim_idx, victim_key, victim_gen);
@@ -292,9 +297,10 @@ void Tree::collect_chunk_entries_in_range(Key lo, Key hi,
 // ---- Flush all chunks to SSD ----
 
 void Tree::flush_leaf(Node* leaf) {
-  // Serialize flush operations on this leaf — only one thread flushes
-  // a given leaf at a time.  Different leaves flush independently.
-  std::unique_lock<std::mutex> flush_lock(leaf->flush_mutex_, std::try_to_lock);
+  // Global flush serialization: at most one thread flushes any leaf to
+  // SSD at a time.  try_to_lock ensures we never block — if another
+  // thread is already flushing, the next put() will retry proactively.
+  std::unique_lock<std::mutex> flush_lock(flush_mutex_, std::try_to_lock);
   if (!flush_lock.owns_lock()) return;
 
   // ---- Phase 1: collect unflushed chunks oldest-first ----
@@ -381,7 +387,11 @@ void Tree::flush_leaf(Node* leaf) {
         flush_and_split_leaf(target);
         Node* correct = find_leaf_for_key(
             target->parent ? target->parent : root_, key);
-        correct->cache_B->upsert(key, val);
+        Status us = correct->cache_B->upsert(key, val);
+        if (us == Status::Full) {
+          evict_to_chunk(correct);
+          correct->cache_B->upsert(key, val);
+        }
       }
     };
 
@@ -442,6 +452,7 @@ void Tree::flush_leaf(Node* leaf) {
     delete c;
   }
   leaf->chunk_count_.fetch_sub(freed.size(), std::memory_order_relaxed);
+  total_chunk_count_.fetch_sub(freed.size(), std::memory_order_relaxed);
 }
 
 // ---- Core operations ----
@@ -512,6 +523,12 @@ Status Tree::put(Key k, Value v) {
       if (s == Status::Ok) {
         if (leaf->version.load(std::memory_order_acquire) != leaf_v) continue;
         evict_leaf_if_needed(leaf);
+        // Deferred batch flush: only flush when enough chunks have
+        // accumulated across the tree to make the SSD I/O worthwhile.
+        if (total_chunk_count_.load(std::memory_order_acquire) >=
+          static_cast<size_t>(flush_batch_threshold_)) {
+          flush_leaf(leaf);
+        }
         return Status::Ok;
       }
       if (s != Status::Full) return s;
@@ -705,55 +722,123 @@ LookupResult Tree::get(Key k) {
       return cr;
     }
 
-    // Placeholder placement (in cache_B only)
+    // Placeholder placement: try cache_A first; only try cache_B if
+    // cache_A didn't get a placeholder (dice roll missed or cache_A full).
     bool has_placed = false;
     int placeholder_idx = -1;
-    if (p_placeholder_ >= 1.0) {
-      Status ps = leaf->cache_B->try_place_placeholder(k, &placeholder_idx);
-      has_placed = (ps == Status::Ok);
-    } else if (p_placeholder_ > 0.0) {
-      if (std::bernoulli_distribution{p_placeholder_}(rng)) {
-        Status ps = leaf->cache_B->try_place_placeholder(k, &placeholder_idx);
-        has_placed = (ps == Status::Ok);
+    CacheAttachment* ph_cache = nullptr;
+
+    auto try_place = [&](CacheAttachment* cache) -> bool {
+      bool attempt = false;
+      if (p_placeholder_ >= 1.0) {
+        attempt = true;
+      } else if (p_placeholder_ > 0.0) {
+        attempt = std::bernoulli_distribution{p_placeholder_}(rng);
       }
+      if (attempt) {
+        Status ps = cache->try_place_placeholder(k, &placeholder_idx);
+        if (ps == Status::Ok) {
+          ph_cache = cache;
+          has_placed = true;
+        }
+      }
+      return has_placed;
+    };
+
+    if (!try_place(leaf->cache_A.get())) {
+      try_place(leaf->cache_B.get());
     }
 
     // Query SSD
     LookupResult r = ssd_->get_record(leaf->page_id, k);
 
-    // Post-SSD cache recheck (cache_B only)
-    LookupResult r2 = leaf->cache_B->lookup(k);
-    if (r2.status == Status::Ok) {
-      if (has_placed) {
-        leaf->cache_B->fill_placeholder(placeholder_idx, r2.value);
-      }
-      if (leaf->version.load(std::memory_order_acquire) == leaf_v) {
-        record_get_hit(false);
-        return r2;
-      }
-      continue;
-    }
-    if (leaf->cache_B->has_absent(k)) {
-      if (has_placed) {
-        leaf->cache_B->fill_placeholder_absent(placeholder_idx);
-      }
-      if (leaf->version.load(std::memory_order_acquire) == leaf_v) {
-        record_get_hit(false);
-        return {Status::NotFound};
-      }
-      continue;
-    }
-
-    // Fill placeholder based on SSD result
+    // Fast path: if we placed a placeholder, try to fill it with the SSD
+    // result.  If the placeholder was untouched during the SSD read, no
+    // concurrent put() modified our key — the SSD result is authoritative.
+    // This eliminates two full cache-probe scans (cache_B + cache_A recheck)
+    // on the common path.
     if (has_placed) {
-      if (r.status == Status::Ok) {
-        leaf->cache_B->fill_placeholder(placeholder_idx, r.value);
-      } else {
-        leaf->cache_B->fill_placeholder_absent(placeholder_idx);
+      Status fill_s = (r.status == Status::Ok)
+          ? ph_cache->fill_placeholder(placeholder_idx, r.value)
+          : ph_cache->fill_placeholder_absent(placeholder_idx);
+
+      if (fill_s == Status::Ok) {
+        // The placeholder was untouched.  However, a concurrent put() may
+        // have written to the OTHER cache (e.g. placeholder in cache_B but
+        // put() wrote to cache_A via p_parent).  Check the other cache.
+        CacheAttachment* other = (ph_cache == leaf->cache_A.get())
+            ? leaf->cache_B.get() : leaf->cache_A.get();
+        LookupResult other_r = other->lookup(k);
+        if (other_r.status == Status::Ok) {
+          // Other cache has a fresher value — use it.
+          ph_cache->fill_placeholder(placeholder_idx, other_r.value);
+          if (leaf->version.load(std::memory_order_acquire) == leaf_v) {
+            record_get_hit(false);
+            return other_r;
+          }
+          continue;
+        }
+        // Both caches missed — SSD result is authoritative.
+        if (leaf->version.load(std::memory_order_acquire) == leaf_v) {
+          record_get_hit(false);
+          return r;
+        }
+        continue;
+      }
+      // fill_placeholder failed — race detected, fall through to rechecks.
+    }
+
+    // Rare path: either we didn't place a placeholder, or a concurrent
+    // put() modified it during the SSD read.  Recheck caches.
+    {
+      LookupResult r2 = leaf->cache_B->lookup(k);
+      if (r2.status == Status::Ok) {
+        if (has_placed) {
+          ph_cache->fill_placeholder(placeholder_idx, r2.value);
+        }
+        if (leaf->version.load(std::memory_order_acquire) == leaf_v) {
+          record_get_hit(false);
+          return r2;
+        }
+        continue;
+      }
+      if (leaf->cache_B->has_absent(k)) {
+        if (has_placed) {
+          ph_cache->fill_placeholder_absent(placeholder_idx);
+        }
+        if (leaf->version.load(std::memory_order_acquire) == leaf_v) {
+          record_get_hit(false);
+          return {Status::NotFound};
+        }
+        continue;
+      }
+
+      LookupResult rA = leaf->cache_A->lookup(k);
+      if (rA.status == Status::Ok) {
+        if (has_placed) {
+          ph_cache->fill_placeholder(placeholder_idx, rA.value);
+        }
+        if (leaf->version.load(std::memory_order_acquire) == leaf_v) {
+          record_get_hit(false);
+          return rA;
+        }
+        continue;
+      }
+      if (leaf->cache_A->has_absent(k)) {
+        if (has_placed) {
+          ph_cache->fill_placeholder_absent(placeholder_idx);
+        }
+        if (leaf->version.load(std::memory_order_acquire) == leaf_v) {
+          record_get_hit(false);
+          return {Status::NotFound};
+        }
+        continue;
       }
     }
 
-    // Version check after read
+    // If we reach here without a placeholder: return the SSD result.
+    // With a placeholder: we already returned on successful fill above;
+    // reaching here means all lookups missed — return SSD result.
     if (leaf->version.load(std::memory_order_acquire) == leaf_v) {
       record_get_hit(false);
       return r;
@@ -766,6 +851,10 @@ LookupResult Tree::get(Key k) {
 void Tree::set_probabilities(double p_parent, double p_placeholder) {
   p_parent_ = p_parent;
   p_placeholder_ = p_placeholder;
+}
+
+void Tree::set_flush_batch_threshold(int threshold) {
+  flush_batch_threshold_ = threshold;
 }
 
 int Tree::debug_height() const {
@@ -850,6 +939,12 @@ Status Tree::debug_flush_all() {
       } while (!leaf->chunk_head_.compare_exchange_weak(old_head, chunk,
                                                          std::memory_order_acq_rel));
       leaf->chunk_count_.fetch_add(1, std::memory_order_relaxed);
+      {
+        size_t t = total_chunk_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        size_t p = peak_chunk_count_.load(std::memory_order_relaxed);
+        while (t > p && !peak_chunk_count_.compare_exchange_weak(p, t,
+            std::memory_order_relaxed)) {}
+      }
 
       for (const auto& [k, v] : dirty) {
         leaf->cache_B->evict_clean_slot(k);
@@ -887,6 +982,12 @@ Status Tree::debug_flush_all() {
           } while (!leaf->chunk_head_.compare_exchange_weak(old_head, chunk,
                                                            std::memory_order_acq_rel));
           leaf->chunk_count_.fetch_add(1, std::memory_order_relaxed);
+          {
+            size_t t = total_chunk_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+            size_t p = peak_chunk_count_.load(std::memory_order_relaxed);
+            while (t > p && !peak_chunk_count_.compare_exchange_weak(p, t,
+                std::memory_order_relaxed)) {}
+          }
 
           for (const auto& [k, v] : dirty) {
             leaf->cache_B->evict_clean_slot(k);
@@ -1167,20 +1268,12 @@ size_t Tree::debug_chunk_count() const {
 }
 
 size_t Tree::debug_peak_chunk_count() const {
-  // Per-leaf chains: peak is the sum across all leaves.
-  // This is a best-effort snapshot — racy but sufficient for debug.
-  size_t total = 0;
-  std::vector<const Node*> leaves;
-  collect_leaves(root_, leaves);
-  for (const Node* leaf : leaves) {
-    total += leaf->chunk_count_.load(std::memory_order_relaxed);
-  }
-  return total;
+  return peak_chunk_count_.load(std::memory_order_relaxed);
 }
 
 void Tree::debug_reset_peak_chunk_count() {
-  // No-op with per-leaf chains — peak tracking is not maintained per-leaf.
-  // debug_peak_chunk_count() now returns a live snapshot instead.
+  peak_chunk_count_.store(0, std::memory_order_relaxed);
+  total_chunk_count_.store(0, std::memory_order_relaxed);
 }
 
 std::vector<size_t> Tree::debug_chunk_len_samples() const {

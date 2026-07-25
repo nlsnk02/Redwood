@@ -10,6 +10,11 @@
 namespace cbtree {
 
 struct CacheSlot {
+  // Seqlock: writers increment before/after modifying slot fields (while holding
+  // slot_mutex).  Readers snapshot seq before reading; if odd or mismatched
+  // after, they retry.  This eliminates mutex acquisition from the read path.
+  mutable std::atomic<uint32_t> seq{0};
+
   SlotState state{SlotState::Empty};
   Key key{};
   Value value{};
