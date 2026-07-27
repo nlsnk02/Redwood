@@ -63,6 +63,9 @@ class Tree {
   std::vector<size_t> debug_chunk_len_samples() const;
   void debug_reset_chunk_len_samples();
 
+  // Set the threshold for deferred batch flush (number of chunks).
+  void set_flush_batch_threshold(int threshold);
+
   // ---- Hit rate statistics (YCSB-compatible API) ----
 
   // Snapshot of current memory hit counters (atomic reads — best-effort).
@@ -137,6 +140,12 @@ class Tree {
   // Master switch: when false, get() skips all counter increments.
   // Read-only on the hot path after initial setup — zero overhead when off.
   bool enable_hit_tracking_{true};
+
+  // Deferred flush: global chunk tracking and batch threshold.
+  mutable std::atomic<size_t> total_chunk_count_{0};
+  mutable std::atomic<size_t> peak_chunk_count_{0};
+  int flush_batch_threshold_{1000};
+  std::mutex flush_mutex_;
 };
 
 }  // namespace cbtree
