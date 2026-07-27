@@ -41,6 +41,14 @@ static const Record* record_at(const std::array<std::byte, kPageSize>& page, uin
   return reinterpret_cast<const Record*>(page.data() + kHeaderSize + index * kRecordSize);
 }
 
+// Thread-local DIO bounce buffer — one per thread so that per-page locking
+// can run concurrent pwrite/pread without a shared buffer.
+thread_local std::array<std::byte, kPageSize> SsDPageStore::tl_dio_buf_{};
+
+static off_t page_offset(PageId id) {
+  return static_cast<off_t>(id * static_cast<PageId>(kPageSize));
+}
+
 SsDPageStore::SsDPageStore(const std::string& file_path, bool use_direct)
     : fd_(-1), use_direct_(use_direct) {
   int flags = O_RDWR | O_CREAT;
@@ -60,7 +68,7 @@ SsDPageStore::~SsDPageStore() {
 }
 
 PageId SsDPageStore::alloc_page() {
-  // Called from split_page (which holds mutex_) or during single-threaded init
+  std::lock_guard<std::mutex> lock(alloc_mutex_);
   off_t end = lseek(fd_, 0, SEEK_END);
   if (end < 0) return 0;
   // Extend file by one page
@@ -68,23 +76,49 @@ PageId SsDPageStore::alloc_page() {
   return static_cast<PageId>(end / static_cast<off_t>(kPageSize));
 }
 
-static off_t page_offset(PageId id) {
-  return static_cast<off_t>(id * static_cast<PageId>(kPageSize));
+// Internal helpers — assume the caller already holds the per-page lock.
+
+Status SsDPageStore::read_page_locked(PageId id, std::array<std::byte, kPageSize>& buf) {
+  off_t off = page_offset(id);
+  void* rd_buf;
+  if (use_direct_) {
+    rd_buf = tl_dio_buf_.data();
+  } else {
+    rd_buf = buf.data();
+  }
+  ssize_t n = pread(fd_, rd_buf, kPageSize, off);
+  if (n != static_cast<ssize_t>(kPageSize)) return Status::Error;
+  if (use_direct_) {
+    std::memcpy(buf.data(), tl_dio_buf_.data(), kPageSize);
+  }
+  return Status::Ok;
 }
 
-Status SsDPageStore::write_page(PageId id, const std::array<std::byte, kPageSize>& buf) {
+Status SsDPageStore::write_page_locked(PageId id, const std::array<std::byte, kPageSize>& buf) {
   off_t off = page_offset(id);
   const void* wr_buf;
   if (use_direct_) {
     // O_DIRECT requires aligned buffers — copy through the bounce buffer.
-    std::memcpy(dio_buf_.data(), buf.data(), kPageSize);
-    wr_buf = dio_buf_.data();
+    std::memcpy(tl_dio_buf_.data(), buf.data(), kPageSize);
+    wr_buf = tl_dio_buf_.data();
   } else {
     wr_buf = buf.data();
   }
   ssize_t written = pwrite(fd_, wr_buf, kPageSize, off);
   if (written != static_cast<ssize_t>(kPageSize)) return Status::Error;
   return Status::Ok;
+}
+
+// ---- Public API with per-page locking ----
+
+Status SsDPageStore::read_page(PageId id, std::array<std::byte, kPageSize>& buf) {
+  std::shared_lock<std::shared_mutex> lock(page_lock(id));
+  return read_page_locked(id, buf);
+}
+
+Status SsDPageStore::write_page(PageId id, const std::array<std::byte, kPageSize>& buf) {
+  std::unique_lock<std::shared_mutex> lock(page_lock(id));
+  return write_page_locked(id, buf);
 }
 
 Status SsDPageStore::sync() {
@@ -94,26 +128,10 @@ Status SsDPageStore::sync() {
   return Status::Ok;
 }
 
-Status SsDPageStore::read_page(PageId id, std::array<std::byte, kPageSize>& buf) {
-  off_t off = page_offset(id);
-  void* rd_buf;
-  if (use_direct_) {
-    rd_buf = dio_buf_.data();
-  } else {
-    rd_buf = buf.data();
-  }
-  ssize_t n = pread(fd_, rd_buf, kPageSize, off);
-  if (n != static_cast<ssize_t>(kPageSize)) return Status::Error;
-  if (use_direct_) {
-    std::memcpy(buf.data(), dio_buf_.data(), kPageSize);
-  }
-  return Status::Ok;
-}
-
 Status SsDPageStore::put_record(PageId id, Key key, Value value) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  std::unique_lock<std::shared_mutex> lock(page_lock(id));
   std::array<std::byte, kPageSize> page{};
-  Status s = read_page(id, page);
+  Status s = read_page_locked(id, page);
   if (s != Status::Ok) return s;
 
   uint32_t count = read_count(page);
@@ -123,7 +141,7 @@ Status SsDPageStore::put_record(PageId id, Key key, Value value) {
     Record* rec = record_at(page, i);
     if (rec->key == key) {
       rec->value = value;
-      return write_page(id, page);
+      return write_page_locked(id, page);
     }
   }
 
@@ -137,15 +155,15 @@ Status SsDPageStore::put_record(PageId id, Key key, Value value) {
   rec->value = value;
   count++;
   write_count(page, count);
-  return write_page(id, page);
+  return write_page_locked(id, page);
 }
 
 Status SsDPageStore::write_page_entries(
     PageId id, const std::vector<std::pair<Key, Value>>& entries,
     std::vector<std::pair<Key, Value>>& overflow) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  std::unique_lock<std::shared_mutex> lock(page_lock(id));
   std::array<std::byte, kPageSize> page{};
-  Status s = read_page(id, page);
+  Status s = read_page_locked(id, page);
   if (s != Status::Ok) return s;
 
   uint32_t count = read_count(page);
@@ -175,13 +193,13 @@ Status SsDPageStore::write_page_entries(
   }
 
   write_count(page, count);
-  return write_page(id, page);
+  return write_page_locked(id, page);
 }
 
 LookupResult SsDPageStore::get_record(PageId id, Key key) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  std::shared_lock<std::shared_mutex> lock(page_lock(id));
   std::array<std::byte, kPageSize> page{};
-  Status s = read_page(id, page);
+  Status s = read_page_locked(id, page);
   if (s != Status::Ok) return {s, 0};
 
   uint32_t count = read_count(page);
@@ -195,9 +213,9 @@ LookupResult SsDPageStore::get_record(PageId id, Key key) {
 }
 
 Status SsDPageStore::dump_sorted(PageId id, std::vector<std::pair<Key, Value>>* out) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  std::shared_lock<std::shared_mutex> lock(page_lock(id));
   std::array<std::byte, kPageSize> page{};
-  Status s = read_page(id, page);
+  Status s = read_page_locked(id, page);
   if (s != Status::Ok) return s;
 
   uint32_t count = read_count(page);
@@ -214,10 +232,13 @@ Status SsDPageStore::dump_sorted(PageId id, std::vector<std::pair<Key, Value>>* 
 }
 
 Status SsDPageStore::split_page(PageId left_id, Key mid, PageId* new_right_id) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  // Lock only the left page — the right page is brand new and not yet
+  // reachable by any other thread.
+  std::unique_lock<std::shared_mutex> left_lock(page_lock(left_id));
+
   // Read left page
   std::array<std::byte, kPageSize> left_page{};
-  Status s = read_page(left_id, left_page);
+  Status s = read_page_locked(left_id, left_page);
   if (s != Status::Ok) return s;
 
   uint32_t left_count = read_count(left_page);
@@ -234,7 +255,7 @@ Status SsDPageStore::split_page(PageId left_id, Key mid, PageId* new_right_id) {
     }
   }
 
-  // Allocate right page
+  // Allocate right page (uses alloc_mutex_, no page lock needed)
   PageId right_id = alloc_page();
   *new_right_id = right_id;
 
@@ -244,16 +265,16 @@ Status SsDPageStore::split_page(PageId left_id, Key mid, PageId* new_right_id) {
   for (size_t i = 0; i < left_records.size(); ++i) {
     *record_at(new_left_page, static_cast<uint32_t>(i)) = left_records[i];
   }
-  s = write_page(left_id, new_left_page);
+  s = write_page_locked(left_id, new_left_page);
   if (s != Status::Ok) return s;
 
-  // Write right page
+  // Write right page — no lock needed (new page, id known only to caller)
   std::array<std::byte, kPageSize> right_page{};
   write_count(right_page, static_cast<uint32_t>(right_records.size()));
   for (size_t i = 0; i < right_records.size(); ++i) {
     *record_at(right_page, static_cast<uint32_t>(i)) = right_records[i];
   }
-  return write_page(right_id, right_page);
+  return write_page_locked(right_id, right_page);
 }
 
 }  // namespace cbtree

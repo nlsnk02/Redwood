@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 #include <utility>
@@ -19,16 +20,18 @@ inline constexpr int kMaxRecordsPerPage = (static_cast<int>(kPageSize) - 4) / 16
 class SsDPageStore {
  public:
   // When use_direct is true, the file is opened with O_DIRECT (bypassing the
-  // OS page cache).  All I/O goes through an aligned bounce buffer to satisfy
-  // O_DIRECT alignment requirements.  fdatasync is never called — data is
-  // written directly to the storage device.
+  // OS page cache).  All I/O goes through a thread-local aligned bounce buffer
+  // to satisfy O_DIRECT alignment requirements.  fdatasync is never called —
+  // data is written directly to the storage device.
   explicit SsDPageStore(const std::string& file_path, bool use_direct = false);
   ~SsDPageStore();
 
   SsDPageStore(const SsDPageStore&) = delete;
   SsDPageStore& operator=(const SsDPageStore&) = delete;
 
-  // Page-level I/O
+  // Page-level I/O — per-page locking:
+  //   read_page  → shared lock (concurrent reads)
+  //   write_page → exclusive lock (one writer per page)
   PageId alloc_page();
   Status write_page(PageId id, const std::array<std::byte, kPageSize>& buf);
   Status read_page(PageId id, std::array<std::byte, kPageSize>& buf);
@@ -51,14 +54,28 @@ class SsDPageStore {
   Status split_page(PageId left_id, Key mid, PageId* new_right_id);
 
  private:
+  // Internal I/O helpers — caller must hold the appropriate page_lock.
+  Status read_page_locked(PageId id, std::array<std::byte, kPageSize>& buf);
+  Status write_page_locked(PageId id, const std::array<std::byte, kPageSize>& buf);
+
+  // Per-page shared_mutex: 64 stripes, indexed by (page_id % 64).
+  // Readers take shared_lock; writers take unique_lock.
+  static constexpr size_t kPageLockCount = 64;
+  mutable std::shared_mutex page_locks_[kPageLockCount];
+
+  std::shared_mutex& page_lock(PageId id) const {
+    return page_locks_[id % kPageLockCount];
+  }
+
+  // Serializes alloc_page() — separate from page I/O locks.
+  std::mutex alloc_mutex_;
+
   int fd_;
   bool use_direct_;
-  mutable std::recursive_mutex mutex_;
 
-  // When use_direct_ is true, all pread/pwrite go through this aligned buffer.
-  // thread-safety: all public methods hold mutex_, so a single buffer is safe.
-  static constexpr size_t kBufAlign = 4096;
-  alignas(kBufAlign) std::array<std::byte, kPageSize> dio_buf_{};
+  // DIO bounce buffer — thread_local since per-page locking allows
+  // concurrent I/O from multiple threads.
+  static thread_local std::array<std::byte, kPageSize> tl_dio_buf_;
 };
 
 }  // namespace cbtree
