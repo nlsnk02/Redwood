@@ -458,11 +458,23 @@ void Tree::flush_leaf(Node* leaf) {
 // ---- Core operations ----
 
 Status Tree::put(Key k, Value v) {
-  thread_local std::mt19937_64 rng(std::random_device{}());
-
   // Always descend to leaf first — no parent cache shortcut.
   std::vector<std::pair<Node*, uint64_t>> versions;
   Node* leaf = descend_to_leaf(k, versions);
+
+  // CMS tracking: increment frequency counter on successful write,
+  // with periodic decay to adapt to workload shifts.
+  auto track_success = [&]() {
+    cms_.increment(k);
+    uint64_t cnt = cms_put_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (cnt % kCMSDecayInterval == 0) {
+      std::unique_lock<std::mutex> lock(cms_decay_mutex_, std::try_to_lock);
+      if (lock.owns_lock()) {
+        cms_.decay(0.5);
+      }
+    }
+    return Status::Ok;
+  };
 
   constexpr int kMaxUpsertRetries = 256;
   for (int retry = 0; retry < kMaxUpsertRetries; ++retry) {
@@ -485,7 +497,7 @@ Status Tree::put(Key k, Value v) {
         if (s == Status::Ok) {
           if (leaf->version.load(std::memory_order_acquire) != leaf_v) continue;
           evict_cache_A_if_needed(leaf);
-          return Status::Ok;
+          return track_success();
         }
       }
 
@@ -496,14 +508,19 @@ Status Tree::put(Key k, Value v) {
         if (s == Status::Ok) {
           if (leaf->version.load(std::memory_order_acquire) != leaf_v) continue;
           evict_cache_A_if_needed(leaf);
-          return Status::Ok;
+          return track_success();
         }
       } else {
         bool use_A = false;
         if (p_parent_ >= 1.0) {
           use_A = true;
         } else if (p_parent_ > 0.0) {
-          use_A = std::bernoulli_distribution{p_parent_}(rng);
+          // Count-Min Sketch: estimate write frequency for this key.
+          // Promote to cache_A when frequency >= admission threshold.
+          // This replaces the old fixed-probability Bernoulli coin flip
+          // with a workload-adaptive decision based on actual access patterns.
+          uint64_t freq = cms_.estimate(k);
+          use_A = (freq >= static_cast<uint64_t>(cms_admission_threshold_));
         }
 
         if (use_A) {
@@ -511,7 +528,7 @@ Status Tree::put(Key k, Value v) {
           if (s == Status::Ok) {
             if (leaf->version.load(std::memory_order_acquire) != leaf_v) continue;
             evict_cache_A_if_needed(leaf);
-            return Status::Ok;
+            return track_success();
           }
         }
       }
@@ -529,7 +546,7 @@ Status Tree::put(Key k, Value v) {
           static_cast<size_t>(flush_batch_threshold_)) {
           flush_leaf(leaf);
         }
-        return Status::Ok;
+        return track_success();
       }
       if (s != Status::Full) return s;
       Status evict_s = evict_to_chunk(leaf);
@@ -855,6 +872,14 @@ void Tree::set_probabilities(double p_parent, double p_placeholder) {
 
 void Tree::set_flush_batch_threshold(int threshold) {
   flush_batch_threshold_ = threshold;
+}
+
+void Tree::set_cms_admission_threshold(int threshold) {
+  cms_admission_threshold_ = threshold;
+}
+
+int Tree::cms_admission_threshold() const {
+  return cms_admission_threshold_;
 }
 
 int Tree::debug_height() const {

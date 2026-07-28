@@ -26,6 +26,7 @@ target_include_directories(cbtree PUBLIC include)
 
 enable_testing()
 add_executable(cbtree_tests
+  tests/test_count_min_sketch.cpp
   tests/test_types_smoke.cpp
   tests/test_fingerprint.cpp
   tests/test_key_lock_table.cpp

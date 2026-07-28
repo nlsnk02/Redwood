@@ -12,6 +12,7 @@
 #include "cbtree/ssd_page_store.hpp"
 #include "cbtree/adaptive_policy.hpp"
 #include "cbtree/chunk.hpp"
+#include "cbtree/count_min_sketch.hpp"
 
 namespace cbtree {
 
@@ -65,6 +66,13 @@ class Tree {
 
   // Set the threshold for deferred batch flush (number of chunks).
   void set_flush_batch_threshold(int threshold);
+
+  // Count-Min Sketch: frequency threshold for cache_A admission.
+  // A key whose estimated write frequency >= |threshold| is routed to cache_A.
+  // Set to 0 to admit all new keys; very large value to admit none.
+  // Default: kCMSAdmissionThreshold (3).
+  void set_cms_admission_threshold(int threshold);
+  int cms_admission_threshold() const;
 
   // ---- Hit rate statistics (YCSB-compatible API) ----
 
@@ -127,6 +135,17 @@ class Tree {
   AdaptivePolicy adaptive_policy_;
   double p_parent_{kDefaultPParent};
   double p_placeholder_{kDefaultPPlaceholder};
+
+  // Count-Min Sketch: tracks per-key write frequency for cache_A admission.
+  // Replaces the fixed Bernoulli(p_parent) decision with frequency-based
+  // admission: a key is promoted to cache_A when its estimated write count
+  // reaches cms_admission_threshold_.  Decay prevents monotonic growth.
+  CountMinSketch<Key, kCMSNumRows, kCMSNumCols> cms_;
+  int cms_admission_threshold_{kCMSAdmissionThreshold};
+  // Per-put increment counter for periodic CMS decay.
+  mutable std::atomic<uint64_t> cms_put_count_{0};
+  // Serializes CMS decay (infrequent, trivial contention).
+  mutable std::mutex cms_decay_mutex_;
 
   // Serializes tree-structure mutations (split_leaf, split_internal).
   // Readers (descend_to_leaf, find_leaf_for_key) take a shared lock.
