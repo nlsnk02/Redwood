@@ -12,7 +12,7 @@ struct Node;  // forward declaration
 // writers — only the background flush thread may read/modify them.
 // Readers traverse the chain with O(1) fingerprint pre-filter per chunk.
 struct EvictChunk {
-  static constexpr size_t kMaxEntries = kCacheSlots;  // 16
+  static constexpr size_t kMaxEntries = kCacheSlots;  // kCacheSlots (64)
 
   PageId page_id;     // target SSD page
   Node* leaf;         // leaf this chunk was evicted from

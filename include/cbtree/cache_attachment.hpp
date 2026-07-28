@@ -48,7 +48,6 @@ class CacheAttachment {
     sorted_flag_.store(false, std::memory_order_release);
   }
 
-  // Future tasks: declared only, not implemented in Task 4
   Status pick_clock_victim(Key* out_key, Value* out_val, bool* out_dirty);
   // Two-phase eviction: find victim without clearing, then evict after SSD write.
   // Captures slot generation for ABA detection.
