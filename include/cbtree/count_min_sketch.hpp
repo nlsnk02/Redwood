@@ -32,14 +32,16 @@ class CountMinSketch {
  public:
   CountMinSketch() { clear(); }
 
-  // Increment the frequency count for |key| by 1.
+  // Increment the frequency count for |key| by |weight| (default 1).
   // O(NumRows) atomic additions — lock-free.
-  void increment(Key key) {
+  // Supports non-uniform weights: reads can contribute weight=1 while
+  // writes contribute weight=N without changing the sketch data structure.
+  void increment(Key key, uint64_t weight = 1) {
     for (size_t r = 0; r < NumRows; ++r) {
       size_t col = hash(key, r) % NumCols;
-      table_[r][col].fetch_add(1, std::memory_order_relaxed);
+      table_[r][col].fetch_add(weight, std::memory_order_relaxed);
     }
-    total_.fetch_add(1, std::memory_order_relaxed);
+    total_.fetch_add(weight, std::memory_order_relaxed);
   }
 
   // Estimate the frequency of |key|.

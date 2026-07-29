@@ -136,14 +136,15 @@ class Tree {
   double p_parent_{kDefaultPParent};
   double p_placeholder_{kDefaultPPlaceholder};
 
-  // Count-Min Sketch: tracks per-key write frequency for cache_A admission.
-  // Replaces the fixed Bernoulli(p_parent) decision with frequency-based
-  // admission: a key is promoted to cache_A when its estimated write count
-  // reaches cms_admission_threshold_.  Decay prevents monotonic growth.
+  // Count-Min Sketch: tracks per-key access frequency for cache_A admission.
+  // Incremented on every put() and on every get() cache miss.
+  // Used for both p_parent (write admission) and p_placeholder (read-miss
+  // placeholder placement) — a key is routed to cache_A when its estimated
+  // access count reaches cms_admission_threshold_.  Decay prevents monotonic growth.
   CountMinSketch<Key, kCMSNumRows, kCMSNumCols> cms_;
   int cms_admission_threshold_{kCMSAdmissionThreshold};
-  // Per-put increment counter for periodic CMS decay.
-  mutable std::atomic<uint64_t> cms_put_count_{0};
+  // Per-operation increment counter for periodic CMS decay (puts + get-misses).
+  mutable std::atomic<uint64_t> cms_op_count_{0};
   // Serializes CMS decay (infrequent, trivial contention).
   mutable std::mutex cms_decay_mutex_;
 

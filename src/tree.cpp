@@ -466,7 +466,7 @@ Status Tree::put(Key k, Value v) {
   // with periodic decay to adapt to workload shifts.
   auto track_success = [&]() {
     cms_.increment(k);
-    uint64_t cnt = cms_put_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint64_t cnt = cms_op_count_.fetch_add(1, std::memory_order_relaxed) + 1;
     if (cnt % kCMSDecayInterval == 0) {
       std::unique_lock<std::mutex> lock(cms_decay_mutex_, std::try_to_lock);
       if (lock.owns_lock()) {
@@ -739,31 +739,56 @@ LookupResult Tree::get(Key k) {
       return cr;
     }
 
-    // Placeholder placement: try cache_A first; only try cache_B if
-    // cache_A didn't get a placeholder (dice roll missed or cache_A full).
+    // Placeholder placement: always attempt when p_placeholder_ > 0.
+    // The CMS access-frequency estimate chooses which cache to try first:
+    //   Hot keys (freq >= threshold) → cache_A first, fallback to cache_B
+    //   Cold keys (freq < threshold) → cache_B first, fallback to cache_A
+    // This protects cache_A from cold-key pollution while ensuring every
+    // read miss gets a placeholder somewhere.
     bool has_placed = false;
     int placeholder_idx = -1;
     CacheAttachment* ph_cache = nullptr;
 
     auto try_place = [&](CacheAttachment* cache) -> bool {
-      bool attempt = false;
-      if (p_placeholder_ >= 1.0) {
-        attempt = true;
-      } else if (p_placeholder_ > 0.0) {
-        attempt = std::bernoulli_distribution{p_placeholder_}(rng);
-      }
-      if (attempt) {
-        Status ps = cache->try_place_placeholder(k, &placeholder_idx);
-        if (ps == Status::Ok) {
-          ph_cache = cache;
-          has_placed = true;
-        }
+      Status ps = cache->try_place_placeholder(k, &placeholder_idx);
+      if (ps == Status::Ok) {
+        ph_cache = cache;
+        has_placed = true;
       }
       return has_placed;
     };
 
-    if (!try_place(leaf->cache_A.get())) {
-      try_place(leaf->cache_B.get());
+    // Increment CMS on read miss — tracks read access frequency alongside
+    // write frequency for a unified hotness signal.
+    cms_.increment(k);
+    {
+      uint64_t cnt = cms_op_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (cnt % kCMSDecayInterval == 0) {
+        std::unique_lock<std::mutex> lock(cms_decay_mutex_, std::try_to_lock);
+        if (lock.owns_lock()) { cms_.decay(0.5); }
+      }
+    }
+
+    uint64_t freq = cms_.estimate(k);
+    bool hot = (freq >= static_cast<uint64_t>(cms_admission_threshold_));
+
+    if (p_placeholder_ >= 1.0) {
+      // Always place: CMS chooses which cache to try first.
+      if (hot) {
+        if (!try_place(leaf->cache_A.get())) try_place(leaf->cache_B.get());
+      } else {
+        if (!try_place(leaf->cache_B.get())) try_place(leaf->cache_A.get());
+      }
+    } else if (p_placeholder_ > 0.0) {
+      // Legacy Bernoulli: p_placeholder_ controls placement probability.
+      // When placing, still use CMS for cache selection.
+      if (std::bernoulli_distribution{p_placeholder_}(rng)) {
+        if (hot) {
+          if (!try_place(leaf->cache_A.get())) try_place(leaf->cache_B.get());
+        } else {
+          if (!try_place(leaf->cache_B.get())) try_place(leaf->cache_A.get());
+        }
+      }
     }
 
     // Query SSD

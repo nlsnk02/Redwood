@@ -46,14 +46,18 @@ inline constexpr double kLeafFillThreshold = 0.8;
 inline constexpr double kDefaultPParent = 0.23;
 inline constexpr double kDefaultPPlaceholder = 1.0;
 
-// Count-Min Sketch parameters for frequency-based cache_A admission.
+// Count-Min Sketch parameters for frequency-based cache admission.
 // d=4 rows × w=1024 columns → 32 KB, ε≈e/1024≈0.27%, δ≈e^{-4}≈1.8%
-// A key is admitted to cache_A when its estimated write frequency >= threshold.
+// A key is admitted to cache_A when its estimated access frequency >= threshold.
+// The sketch tracks both write (put) and read-miss (get) access frequency with
+// equal weight, providing a unified "hotness" signal for both p_parent and
+// p_placeholder decisions.
 inline constexpr int kCMSNumRows = 4;
 inline constexpr int kCMSNumCols = 1024;
 inline constexpr int kCMSAdmissionThreshold = 3;
-// Decay counters by halving every kCMSDecayInterval writes to prevent
-// monotonic growth and adapt to workload shifts.
-inline constexpr int kCMSDecayInterval = 10000;
+// Decay counters by halving every kCMSDecayInterval operations (puts + get-misses)
+// to prevent monotonic growth and adapt to workload shifts.
+// Larger than the original 10K because reads are now counted alongside writes.
+inline constexpr int kCMSDecayInterval = 200000;
 
 }  // namespace cbtree
