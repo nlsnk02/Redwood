@@ -165,7 +165,7 @@ Status Tree::evict_to_chunk(Node* leaf) {
     leaf->cache_B->evict_clean_slot(k);
   }
 
-  // 5. RELEASE eviction_mutex — chunk is on the chain, visible to readers.
+  // 6. RELEASE eviction_mutex — chunk is on the chain, visible to readers.
   //    Flush is DEFERRED: when total_chunk_count_ >= flush_batch_threshold_,
   //    the next put() that modifies cache_B will proactively flush one leaf's chunks.
   evict_lock.unlock();
@@ -354,9 +354,178 @@ void Tree::flush_leaf(Node* leaf) {
       page_leaf[leaf->page_id] = leaf;
     }
 
-    // Helper: flush one batch of entries to a page.
-    auto flush_batch = [&](PageId pid,
-                           std::vector<std::pair<Key, Value>>& entries) {
+    // Helper: batch-merge flush — reads existing page data, merges with
+    // new entries, pre-splits the leaf when total > kMaxRecordsPerPage,
+    // then writes every page with exactly ≤ 255 entries.  Zero overflow.
+    auto flush_batch_merged = [&](Node* target_leaf, PageId pid,
+                                   std::vector<std::pair<Key, Value>>& entries) {
+      if (entries.empty()) return;
+
+      // 1. Read existing page data from SSD.
+      std::vector<std::pair<Key, Value>> existing;
+      ssd_->dump_sorted(pid, &existing);
+
+      // 2. Merge existing + new, sort by key, dedup keeping newest.
+      std::vector<std::pair<Key, Value>> merged;
+      merged.reserve(existing.size() + entries.size());
+      merged.insert(merged.end(), existing.begin(), existing.end());
+      merged.insert(merged.end(), entries.begin(), entries.end());
+      std::sort(merged.begin(), merged.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+
+      size_t w = 0;
+      for (size_t i = 1; i < merged.size(); ++i) {
+        if (merged[i].first != merged[w].first) {
+          ++w;
+          if (w != i) merged[w] = merged[i];
+        } else {
+          merged[w] = merged[i];  // newer (entries) overwrites older (existing)
+        }
+      }
+      merged.resize(w + 1);
+
+      // 3. Fast path: everything fits in a single page.
+      if (merged.size() <= static_cast<size_t>(kMaxRecordsPerPage)) {
+        std::vector<std::pair<Key, Value>> dummy;
+        Status s = ssd_->write_page_entries(pid, merged, dummy);
+        if (s != Status::Ok) {
+          for (const auto& [key, val] : merged)
+            target_leaf->cache_B->upsert(key, val);
+          return;
+        }
+        for (const auto& [key, val] : merged)
+          register_in_leaf_index(target_leaf, key);
+        return;
+      }
+
+      // 4. Multiple pages needed: group merged entries into kMaxRecordsPerPage
+      //    chunks, each destined for its own SSD page / leaf node.
+      size_t total = merged.size();
+      size_t num_pages = (total + kMaxRecordsPerPage - 1) / kMaxRecordsPerPage;
+      std::vector<std::vector<std::pair<Key, Value>>> groups(num_pages);
+      for (size_t i = 0; i < total; ++i)
+        groups[i / kMaxRecordsPerPage].push_back(merged[i]);
+
+      // First-key boundaries between groups.
+      std::vector<Key> boundaries;
+      for (size_t p = 0; p < num_pages; ++p)
+        boundaries.push_back(groups[p][0].first);
+
+      // 5. Create new leaf nodes + SSD pages for groups [1, num_pages-1].
+      std::vector<Node*> leaves;
+      std::vector<PageId> page_ids;
+      leaves.push_back(target_leaf);
+      page_ids.push_back(pid);
+
+      {
+        std::unique_lock<std::shared_mutex> tree_lock(tree_mutex_);
+        target_leaf->version.fetch_add(1, std::memory_order_acq_rel);
+
+        for (size_t p = 1; p < num_pages; ++p) {
+          PageId new_pid = ssd_->alloc_page();
+          Node* new_leaf = new Node{};
+          new_leaf->height = 1;
+          new_leaf->cache_A = std::make_unique<CacheAttachment>();
+          new_leaf->cache_B = std::make_unique<CacheAttachment>();
+          new_leaf->page_id = new_pid;
+          page_ids.push_back(new_pid);
+          leaves.push_back(new_leaf);
+        }
+
+        // ---- B-link protocol ----
+        Key old_high = target_leaf->high_key;
+        Node* old_next = target_leaf->next_sibling.load(
+            std::memory_order_acquire);
+
+        // Truncate each leaf's high_key at the next group's first key.
+        for (size_t p = 0; p < num_pages - 1; ++p)
+          leaves[p]->high_key = boundaries[p + 1];
+        leaves.back()->high_key = old_high;
+
+        // Link siblings BEFORE high_key update so readers can chase right.
+        for (size_t p = 0; p < num_pages - 1; ++p) {
+          leaves[p]->next_sibling.store(leaves[p + 1],
+                                        std::memory_order_release);
+          leaves[p + 1]->prev_sibling.store(leaves[p],
+                                            std::memory_order_release);
+        }
+        leaves.back()->next_sibling.store(old_next,
+                                          std::memory_order_release);
+        if (old_next)
+          old_next->prev_sibling.store(leaves.back(),
+                                       std::memory_order_release);
+
+        // Update parent (or create new root).
+        if (target_leaf == root_) {
+          Node* new_root = new Node{};
+          new_root->height = target_leaf->height + 1;
+          new_root->separators.reserve(kInternalFanout + 2);
+          new_root->children.reserve(kInternalFanout + 2);
+          for (size_t p = 0; p < num_pages - 1; ++p)
+            new_root->separators.push_back(boundaries[p + 1]);
+          for (size_t p = 0; p < num_pages; ++p) {
+            new_root->children.push_back(leaves[p]);
+            leaves[p]->parent = new_root;
+          }
+          root_ = new_root;
+        } else {
+          Node* parent = target_leaf->parent;
+          auto it = std::find(parent->children.begin(),
+                              parent->children.end(), target_leaf);
+          size_t idx = static_cast<size_t>(it - parent->children.begin());
+          for (size_t p = 1; p < num_pages; ++p) {
+            Key sep = boundaries[p];
+            auto sit = std::lower_bound(
+                parent->separators.begin() + static_cast<long>(idx),
+                parent->separators.end(), sep);
+            size_t sidx =
+                static_cast<size_t>(sit - parent->separators.begin());
+            parent->separators.insert(sit, sep);
+            parent->children.insert(
+                parent->children.begin() + static_cast<long>(sidx) + 1,
+                leaves[p]);
+            leaves[p]->parent = parent;
+          }
+        }
+
+        // Split caches across the new leaves.
+        for (size_t p = 0; p < num_pages - 1; ++p) {
+          leaves[p]->cache_A->split_into(boundaries[p + 1],
+                                          leaves[p + 1]->cache_A.get());
+          leaves[p]->cache_B->split_into(boundaries[p + 1],
+                                          leaves[p + 1]->cache_B.get());
+        }
+
+        target_leaf->version.fetch_add(1, std::memory_order_acq_rel);
+
+        bool need_split_internal =
+            target_leaf->parent &&
+            target_leaf->parent->children.size() > kInternalFanout;
+        Node* split_parent = target_leaf->parent;
+        tree_lock.unlock();
+
+        if (need_split_internal) split_internal(split_parent);
+      }
+
+      // 6. Write each page — every group ≤ 255 entries, zero overflow.
+      for (size_t p = 0; p < num_pages; ++p) {
+        std::vector<std::pair<Key, Value>> dummy;
+        Status s = ssd_->write_page_entries(page_ids[p], groups[p], dummy);
+        if (s != Status::Ok) {
+          for (const auto& [key, val] : groups[p])
+            leaves[p]->cache_B->upsert(key, val);
+          continue;
+        }
+        for (const auto& [key, val] : groups[p])
+          register_in_leaf_index(leaves[p], key);
+      }
+    };
+
+    // Helper: original per-entry overflow handling for remote entries.
+    // Remote groups are small (only entries that crossed a split boundary),
+    // so the per-entry cost is negligible here.
+    auto flush_batch_remote = [&](PageId pid,
+                                   std::vector<std::pair<Key, Value>>& entries) {
       std::vector<std::pair<Key, Value>> overflow;
       Status s = ssd_->write_page_entries(pid, entries, overflow);
       if (s != Status::Ok) {
@@ -365,15 +534,11 @@ void Tree::flush_leaf(Node* leaf) {
         return;
       }
 
-      // Register successfully-written entries.
       Node* n = page_leaf[pid];
       if (overflow.empty()) {
-        // Fast path: no overflow — register all entries directly.
-        for (const auto& [key, val] : entries) {
+        for (const auto& [key, val] : entries)
           register_in_leaf_index(n, key);
-        }
       } else {
-        // Slow path: filter overflow entries from registration.
         std::set<Key> overflow_keys;
         for (const auto& [k, v] : overflow) overflow_keys.insert(k);
         for (const auto& [key, val] : entries) {
@@ -395,13 +560,13 @@ void Tree::flush_leaf(Node* leaf) {
       }
     };
 
-    // Write local entries: one read + one write for this leaf's page.
+    // Write local entries: batch merge → pre-split → zero overflow.
     if (!local_entries.empty()) {
-      flush_batch(leaf->page_id, local_entries);
+      flush_batch_merged(leaf, leaf->page_id, local_entries);
     }
-    // Write remote entries: one read + one write per sibling page.
+    // Write remote entries: original per-leaf logic.
     for (auto& [pid, entries] : remote) {
-      flush_batch(pid, entries);
+      flush_batch_remote(pid, entries);
     }
   }
 
