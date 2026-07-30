@@ -49,6 +49,12 @@ class CacheAttachment {
   }
 
   Status pick_clock_victim(Key* out_key, Value* out_val, bool* out_dirty);
+  // Collect clean Occupied and Absent entries via CLOCK for read-buffer eviction.
+  // Does NOT modify slot state — caller must evict after chunk creation.
+  // out_is_absent[i] is true when entries[i] came from an Absent slot.
+  // Returns number of entries collected (0 if nothing eligible).
+  int collect_clean_clock(std::vector<std::pair<Key, Value>>& out,
+                          std::vector<bool>& out_is_absent, int max_count);
   // Two-phase eviction: find victim without clearing, then evict after SSD write.
   // Captures slot generation for ABA detection.
   Status find_clock_victim(Key* out_key, Value* out_val, bool* out_dirty,

@@ -340,7 +340,7 @@ Status CacheAttachment::fill_placeholder(int idx, Value v) {
   slots_[idx].seq.fetch_add(1, std::memory_order_release);
   slots_[idx].value = v;
   slots_[idx].state = SlotState::Occupied;
-  slots_[idx].dirty = true;
+  slots_[idx].dirty = false;  // data came from SSD, already persisted
   slots_[idx].seq.fetch_add(1, std::memory_order_release);
   return Status::Ok;
 }
@@ -444,6 +444,46 @@ Status CacheAttachment::pick_clock_victim(Key* out_key, Value* out_val,
   }
 
   return Status::Error;  // nothing to evict
+}
+
+int CacheAttachment::collect_clean_clock(
+    std::vector<std::pair<Key, Value>>& out,
+    std::vector<bool>& out_is_absent, int max_count) {
+  out.clear();
+  out_is_absent.clear();
+  if (max_count <= 0) return 0;
+
+  // CLOCK scan: select up to max_count clean Occupied or Absent entries.
+  // Does NOT modify slot state — caller must evict after chunk creation.
+  for (int round = 0; round < 2 * kCacheSlots && static_cast<int>(out.size()) < max_count; ++round) {
+    size_t idx = hand_.fetch_add(1, std::memory_order_relaxed) % kCacheSlots;
+
+    {
+      std::lock_guard<std::mutex> lock(slots_[idx].slot_mutex);
+      SlotState st = slots_[idx].state;
+      if (st != SlotState::Occupied && st != SlotState::Absent) continue;
+
+      // Skip dirty entries — they go through flush_dirty / dirty chunk path.
+      if (st == SlotState::Occupied && slots_[idx].dirty) continue;
+
+      // CLOCK second-chance: give recently accessed entries another pass.
+      bool bit = slots_[idx].clock_bit.load(std::memory_order_acquire);
+      if (bit) {
+        slots_[idx].clock_bit.store(false, std::memory_order_release);
+        continue;
+      }
+
+      // Found a victim — copy data, leave slot intact.
+      out.emplace_back(slots_[idx].key, slots_[idx].value);
+      out_is_absent.push_back(st == SlotState::Absent);
+
+      // Clear clock_bit so this entry won't be re-selected immediately if
+      // it stays in cache (caller may decide not to evict it).
+      slots_[idx].clock_bit.store(false, std::memory_order_release);
+    }
+  }
+
+  return static_cast<int>(out.size());
 }
 
 Status CacheAttachment::find_clock_victim(Key* out_key, Value* out_val,
@@ -604,11 +644,12 @@ bool CacheAttachment::evict_clean_slot(Key k) {
 
     if (st == SlotState::Empty) return false;  // end of chain, key not found
     if (st == SlotState::Tombstone) continue;
-    if (st != SlotState::Occupied) continue;
+    if (st != SlotState::Occupied && st != SlotState::Absent) continue;
     if (slots_[idx].fp != fp) continue;
     if (slots_[idx].key != k) continue;
     // Only clear if clean — another thread may have re-dirtied it.
-    if (slots_[idx].dirty) return false;
+    // Absent entries are always clean (no data to persist).
+    if (st == SlotState::Occupied && slots_[idx].dirty) return false;
     slots_[idx].seq.fetch_add(1, std::memory_order_release);
     slots_[idx].state = SlotState::Tombstone;
     tombstone_count_.fetch_add(1, std::memory_order_relaxed);

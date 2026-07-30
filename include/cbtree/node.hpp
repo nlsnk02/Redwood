@@ -47,6 +47,7 @@ struct Node {
   // Each leaf owns its own chain — no global CAS contention.
   std::atomic<EvictChunk*> chunk_head_{nullptr};
   std::atomic<size_t> chunk_count_{0};
+  std::atomic<size_t> dirty_chunk_count_{0};  // subset of chunk_count_ for dirty chunks
 
   // Reader count: incremented before traversing this leaf's chunk chain,
   // decremented after. flush_leaf waits for this to reach 0 before freeing.

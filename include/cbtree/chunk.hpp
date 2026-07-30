@@ -18,10 +18,15 @@ struct EvictChunk {
   Node* leaf;         // leaf this chunk was evicted from
   size_t num_entries;
 
+  // Distinguishes dirty chunks (SSD safety net, must be written to SSD)
+  // from clean chunks (read buffer, already on SSD, discard/compact on flush).
+  bool is_clean_only = false;
+
   struct Entry {
     Key key;
     Value value;
     Fingerprint fp;
+    bool is_absent = false;  // true → negative-cache entry (Absent slot)
   };
   Entry entries[kMaxEntries];
 

@@ -120,55 +120,110 @@ Status Tree::evict_to_chunk(Node* leaf) {
   std::unique_lock<std::mutex> evict_lock(leaf->eviction_mutex, std::try_to_lock);
   if (!evict_lock.owns_lock()) return Status::Retry;
 
-  // 1. Collect all dirty entries and mark them clean (keeps slots Occupied).
+  // ---- Phase 1: flush dirty entries → dirty chunk ----
   std::vector<std::pair<Key, Value>> dirty;
   leaf->cache_B->flush_dirty(dirty);
-  if (dirty.empty()) {
+
+  bool pushed_dirty = false;
+  if (!dirty.empty()) {
+    auto* chunk = new EvictChunk{};
+    chunk->page_id = leaf->page_id;
+    chunk->leaf = leaf;
+    chunk->num_entries = dirty.size();
+    chunk->is_clean_only = false;
+    for (size_t i = 0; i < dirty.size(); ++i) {
+      chunk->entries[i].key = dirty[i].first;
+      chunk->entries[i].value = dirty[i].second;
+      chunk->entries[i].fp = fingerprint(dirty[i].first);
+    }
+
+    // Push to lock-free chain (newest at head).
+    // The chunk is NOW visible to readers — safety net for the window
+    // between cache eviction and SSD write.
+    {
+      EvictChunk* old_head = leaf->chunk_head_.load(std::memory_order_acquire);
+      do {
+        chunk->next.store(old_head, std::memory_order_release);
+      } while (!leaf->chunk_head_.compare_exchange_weak(old_head, chunk,
+                                                         std::memory_order_acq_rel));
+    }
+    leaf->chunk_count_.fetch_add(1, std::memory_order_relaxed);
+    leaf->dirty_chunk_count_.fetch_add(1, std::memory_order_relaxed);
+    {
+      size_t t = total_chunk_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+      size_t p = peak_chunk_count_.load(std::memory_order_relaxed);
+      while (t > p && !peak_chunk_count_.compare_exchange_weak(p, t,
+          std::memory_order_relaxed)) {}
+    }
+    pushed_dirty = true;
+  }
+
+  // ---- Phase 2: if still near capacity, flush clean entries → clean chunk ----
+  // Clean chunks are a read buffer — entries already on SSD, no I/O needed on flush.
+  std::vector<std::pair<Key, Value>> clean;
+  std::vector<bool> clean_is_absent;
+  bool pushed_clean = false;
+
+  if (leaf->cache_B->occupied_count() >
+      static_cast<int>(kCacheSlots * kLeafFillThreshold)) {
+    int n = leaf->cache_B->collect_clean_clock(clean, clean_is_absent, 16);
+    if (n > 0) {
+      auto* chunk = new EvictChunk{};
+      chunk->page_id = leaf->page_id;
+      chunk->leaf = leaf;
+      chunk->num_entries = static_cast<size_t>(n);
+      chunk->is_clean_only = true;
+      for (int i = 0; i < n; ++i) {
+        chunk->entries[i].key = clean[i].first;
+        chunk->entries[i].value = clean[i].second;
+        chunk->entries[i].fp = fingerprint(clean[i].first);
+        chunk->entries[i].is_absent = clean_is_absent[i];
+      }
+
+      {
+        EvictChunk* old_head = leaf->chunk_head_.load(std::memory_order_acquire);
+        do {
+          chunk->next.store(old_head, std::memory_order_release);
+        } while (!leaf->chunk_head_.compare_exchange_weak(old_head, chunk,
+                                                           std::memory_order_acq_rel));
+      }
+      leaf->chunk_count_.fetch_add(1, std::memory_order_relaxed);
+      {
+        size_t t = total_chunk_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        size_t p = peak_chunk_count_.load(std::memory_order_relaxed);
+        while (t > p && !peak_chunk_count_.compare_exchange_weak(p, t,
+            std::memory_order_relaxed)) {}
+      }
+      pushed_clean = true;
+    }
+  }
+
+  // ---- Phase 3: clear cache slots ----
+  if (pushed_dirty) {
+    for (const auto& [k, v] : dirty) {
+      leaf->cache_B->evict_clean_slot(k);
+    }
+  }
+  if (pushed_clean) {
+    for (const auto& [k, v] : clean) {
+      leaf->cache_B->evict_clean_slot(k);
+    }
+  }
+
+  // Fallback: if nothing was pushed (no dirty, no clean eligible), wipe all clean.
+  if (!pushed_dirty && !pushed_clean) {
     leaf->cache_B->clear_clean_occupied();
     return Status::Ok;
   }
 
-  // 2. Create chunk with collected entries.
-  auto* chunk = new EvictChunk{};
-  chunk->page_id = leaf->page_id;
-  chunk->leaf = leaf;
-  chunk->num_entries = dirty.size();
-  for (size_t i = 0; i < dirty.size(); ++i) {
-    chunk->entries[i].key = dirty[i].first;
-    chunk->entries[i].value = dirty[i].second;
-    chunk->entries[i].fp = fingerprint(dirty[i].first);
-  }
-
-  // 3. Push chunk to this leaf's lock-free chain (newest at head).
-  //    Per-leaf chains eliminate global CAS contention between leaves.
-  //    The chunk is NOW visible to readers (get/scan) — this is the safety
-  //    net that covers the window between cache eviction and SSD write.
-  {
-    EvictChunk* old_head = leaf->chunk_head_.load(std::memory_order_acquire);
-    do {
-      chunk->next.store(old_head, std::memory_order_release);
-    } while (!leaf->chunk_head_.compare_exchange_weak(old_head, chunk,
-                                                       std::memory_order_acq_rel));
-  }
-  leaf->chunk_count_.fetch_add(1, std::memory_order_relaxed);
-  {
-    size_t t = total_chunk_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-    size_t p = peak_chunk_count_.load(std::memory_order_relaxed);
-    while (t > p && !peak_chunk_count_.compare_exchange_weak(p, t,
-        std::memory_order_relaxed)) {}
-  }
-
-  // 4. Clear cache slots for entries now in the chunk.
-  //    Only clears slots that are still clean (not re-dirtied by another
-  //    thread). Re-dirtied slots stay Occupied for the next eviction.
-  for (const auto& [k, v] : dirty) {
-    leaf->cache_B->evict_clean_slot(k);
-  }
-
-  // 6. RELEASE eviction_mutex — chunk is on the chain, visible to readers.
-  //    Flush is DEFERRED: when total_chunk_count_ >= flush_batch_threshold_,
-  //    the next put() that modifies cache_B will proactively flush one leaf's chunks.
+  // ---- Phase 4: deferred batch flush check ----
   evict_lock.unlock();
+
+  size_t dc = leaf->dirty_chunk_count_.load(std::memory_order_acquire);
+  size_t tc = leaf->chunk_count_.load(std::memory_order_acquire);
+      if (dc > 16 || tc > 20) {
+    flush_leaf(leaf);
+  }
 
   return Status::Ok;
 }
@@ -192,9 +247,12 @@ Status Tree::evict_cache_A_if_needed(Node* leaf) {
       evict_leaf_if_needed(leaf);  // ensure cache_B has room
       leaf->cache_B->upsert(victim_key, victim_val);
       // Deferred batch flush: modified cache_B via demotion.
-      if (total_chunk_count_.load(std::memory_order_acquire) >=
-          static_cast<size_t>(flush_batch_threshold_)) {
-        flush_leaf(leaf);
+      {
+        size_t dc = leaf->dirty_chunk_count_.load(std::memory_order_acquire);
+        size_t tc = leaf->chunk_count_.load(std::memory_order_acquire);
+            if (dc > 16 || tc > 20) {
+          flush_leaf(leaf);
+        }
       }
     }
   }
@@ -238,6 +296,11 @@ LookupResult Tree::lookup_chunks(Key k) {
         if (head->entries[i].fp != fp) continue;
         if (head->entries[i].key == k) {
           cur->chunk_readers_.fetch_sub(1, std::memory_order_release);
+          if (head->entries[i].is_absent) {
+            LookupResult r{Status::NotFound};
+            r.absent = true;
+            return r;
+          }
           return {Status::Ok, head->entries[i].value};
         }
       }
@@ -283,6 +346,7 @@ void Tree::collect_chunk_entries_in_range(Key lo, Key hi,
       for (size_t i = 0; i < head->num_entries; ++i) {
         Key k = head->entries[i].key;
         if (k < lo || k > hi) continue;
+        if (head->entries[i].is_absent) continue;  // negative cache, skip
         if (out.find(k) == out.end()) {
           out[k] = head->entries[i].value;
         }
@@ -297,10 +361,10 @@ void Tree::collect_chunk_entries_in_range(Key lo, Key hi,
 // ---- Flush all chunks to SSD ----
 
 void Tree::flush_leaf(Node* leaf) {
-  // Global flush serialization: at most one thread flushes any leaf to
-  // SSD at a time.  try_to_lock ensures we never block — if another
-  // thread is already flushing, the next put() will retry proactively.
-  std::unique_lock<std::mutex> flush_lock(flush_mutex_, std::try_to_lock);
+  // Per-leaf flush serialization: at most one thread flushes this leaf
+  // at a time.  try_to_lock ensures we never block — if another thread
+  // is already flushing this leaf, the caller will retry next time.
+  std::unique_lock<std::mutex> flush_lock(leaf->flush_mutex_, std::try_to_lock);
   if (!flush_lock.owns_lock()) return;
 
   // ---- Phase 1: collect unflushed chunks oldest-first ----
@@ -319,53 +383,56 @@ void Tree::flush_leaf(Node* leaf) {
     std::reverse(to_flush.begin(), to_flush.end());
   }
 
-  if (to_flush.empty()) return;
+  // Separate dirty (must write to SSD) from clean (read buffer, no I/O).
+  std::vector<EvictChunk*> dirty_to_flush;
+  std::vector<EvictChunk*> clean_chunks;
+  for (EvictChunk* c : to_flush) {
+    if (c->is_clean_only) {
+      clean_chunks.push_back(c);
+    } else {
+      dirty_to_flush.push_back(c);
+    }
+  }
 
-  // ---- Phase 2: batch-write to SSD ----
-  // Walk each chunk's entries.  Entries with key < leaf->high_key still
+  if (dirty_to_flush.empty() && clean_chunks.empty()) return;
+
+  // ---- Phase 2: batch-write dirty chunks to SSD ----
+  // Walk each dirty chunk's entries.  Entries with key < leaf->high_key still
   // belong to this leaf's page — batch them into a single read+write.
   // Entries with key >= high_key were moved to a sibling by a split;
   // route those to the correct page via find_leaf_for_key (rare path).
-  // This eliminates O(N) tree descents: almost all entries take the
-  // cheap range check.
-  {
+  // Clean chunks are skipped here — their data is already on SSD.
+  if (!dirty_to_flush.empty()) {
     std::vector<std::pair<Key, Value>> local_entries;
     std::map<PageId, std::vector<std::pair<Key, Value>>> remote;
     std::map<PageId, Node*> page_leaf;  // for registration
 
     Key hk = leaf->high_key;
-    for (EvictChunk* c : to_flush) {
+    for (EvictChunk* c : dirty_to_flush) {
       for (size_t i = 0; i < c->num_entries; ++i) {
         Key key = c->entries[i].key;
         Value val = c->entries[i].value;
         if (hk == std::numeric_limits<Key>::max() || key < hk) {
-          // Fast path: still in this leaf's range.
           local_entries.emplace_back(key, val);
         } else {
-          // Slow path: may have been split to a sibling.
           Node* target = find_leaf_for_key(root_, key);
           remote[target->page_id].emplace_back(key, val);
           page_leaf[target->page_id] = target;
         }
       }
     }
-    // Only one page for local entries.
     if (!local_entries.empty()) {
       page_leaf[leaf->page_id] = leaf;
     }
 
-    // Helper: batch-merge flush — reads existing page data, merges with
-    // new entries, pre-splits the leaf when total > kMaxRecordsPerPage,
-    // then writes every page with exactly ≤ 255 entries.  Zero overflow.
+    // Helper: batch-merge flush (same as before).
     auto flush_batch_merged = [&](Node* target_leaf, PageId pid,
                                    std::vector<std::pair<Key, Value>>& entries) {
       if (entries.empty()) return;
 
-      // 1. Read existing page data from SSD.
       std::vector<std::pair<Key, Value>> existing;
       ssd_->dump_sorted(pid, &existing);
 
-      // 2. Merge existing + new, sort by key, dedup keeping newest.
       std::vector<std::pair<Key, Value>> merged;
       merged.reserve(existing.size() + entries.size());
       merged.insert(merged.end(), existing.begin(), existing.end());
@@ -379,12 +446,11 @@ void Tree::flush_leaf(Node* leaf) {
           ++w;
           if (w != i) merged[w] = merged[i];
         } else {
-          merged[w] = merged[i];  // newer (entries) overwrites older (existing)
+          merged[w] = merged[i];
         }
       }
       merged.resize(w + 1);
 
-      // 3. Fast path: everything fits in a single page.
       if (merged.size() <= static_cast<size_t>(kMaxRecordsPerPage)) {
         std::vector<std::pair<Key, Value>> dummy;
         Status s = ssd_->write_page_entries(pid, merged, dummy);
@@ -398,20 +464,16 @@ void Tree::flush_leaf(Node* leaf) {
         return;
       }
 
-      // 4. Multiple pages needed: group merged entries into kMaxRecordsPerPage
-      //    chunks, each destined for its own SSD page / leaf node.
       size_t total = merged.size();
       size_t num_pages = (total + kMaxRecordsPerPage - 1) / kMaxRecordsPerPage;
       std::vector<std::vector<std::pair<Key, Value>>> groups(num_pages);
       for (size_t i = 0; i < total; ++i)
         groups[i / kMaxRecordsPerPage].push_back(merged[i]);
 
-      // First-key boundaries between groups.
       std::vector<Key> boundaries;
       for (size_t p = 0; p < num_pages; ++p)
         boundaries.push_back(groups[p][0].first);
 
-      // 5. Create new leaf nodes + SSD pages for groups [1, num_pages-1].
       std::vector<Node*> leaves;
       std::vector<PageId> page_ids;
       leaves.push_back(target_leaf);
@@ -432,17 +494,14 @@ void Tree::flush_leaf(Node* leaf) {
           leaves.push_back(new_leaf);
         }
 
-        // ---- B-link protocol ----
         Key old_high = target_leaf->high_key;
         Node* old_next = target_leaf->next_sibling.load(
             std::memory_order_acquire);
 
-        // Truncate each leaf's high_key at the next group's first key.
         for (size_t p = 0; p < num_pages - 1; ++p)
           leaves[p]->high_key = boundaries[p + 1];
         leaves.back()->high_key = old_high;
 
-        // Link siblings BEFORE high_key update so readers can chase right.
         for (size_t p = 0; p < num_pages - 1; ++p) {
           leaves[p]->next_sibling.store(leaves[p + 1],
                                         std::memory_order_release);
@@ -455,7 +514,6 @@ void Tree::flush_leaf(Node* leaf) {
           old_next->prev_sibling.store(leaves.back(),
                                        std::memory_order_release);
 
-        // Update parent (or create new root).
         if (target_leaf == root_) {
           Node* new_root = new Node{};
           new_root->height = target_leaf->height + 1;
@@ -488,7 +546,6 @@ void Tree::flush_leaf(Node* leaf) {
           }
         }
 
-        // Split caches across the new leaves.
         for (size_t p = 0; p < num_pages - 1; ++p) {
           leaves[p]->cache_A->split_into(boundaries[p + 1],
                                           leaves[p + 1]->cache_A.get());
@@ -507,7 +564,6 @@ void Tree::flush_leaf(Node* leaf) {
         if (need_split_internal) split_internal(split_parent);
       }
 
-      // 6. Write each page — every group ≤ 255 entries, zero overflow.
       for (size_t p = 0; p < num_pages; ++p) {
         std::vector<std::pair<Key, Value>> dummy;
         Status s = ssd_->write_page_entries(page_ids[p], groups[p], dummy);
@@ -521,9 +577,6 @@ void Tree::flush_leaf(Node* leaf) {
       }
     };
 
-    // Helper: original per-entry overflow handling for remote entries.
-    // Remote groups are small (only entries that crossed a split boundary),
-    // so the per-entry cost is negligible here.
     auto flush_batch_remote = [&](PageId pid,
                                    std::vector<std::pair<Key, Value>>& entries) {
       std::vector<std::pair<Key, Value>> overflow;
@@ -560,25 +613,63 @@ void Tree::flush_leaf(Node* leaf) {
       }
     };
 
-    // Write local entries: batch merge → pre-split → zero overflow.
     if (!local_entries.empty()) {
       flush_batch_merged(leaf, leaf->page_id, local_entries);
     }
-    // Write remote entries: original per-leaf logic.
     for (auto& [pid, entries] : remote) {
       flush_batch_remote(pid, entries);
     }
   }
 
-  // ---- Phase 3: data is written to SSD (O_DIRECT bypasses page cache) ----
+  // ---- Phase 3: compact clean chunks into a single read-buffer chunk ----
+  // Merge all clean entries (newest wins since reversed list is oldest-first),
+  // dedup by key, keep at most kMaxEntries (discard overflow = LRU-like eviction).
+  EvictChunk* compact_clean = nullptr;
+  if (!clean_chunks.empty()) {
+    // Collect entries newest-first (reverse reversed list back).
+    // When the same key appears in multiple clean chunks, the one closer to
+    // head (newer) wins.  Iterating clean_chunks forward (oldest→newest)
+    // naturally lets newer values overwrite older ones in the map.
+    std::map<Key, std::pair<Value, bool>> merged;  // key → (value, is_absent)
+    for (EvictChunk* c : clean_chunks) {
+      for (size_t i = 0; i < c->num_entries; ++i) {
+        merged[c->entries[i].key] = {c->entries[i].value,
+                                     c->entries[i].is_absent};
+      }
+    }
 
-  // ---- Phase 4: mark chunks as flushed ----
-  for (EvictChunk* c : to_flush) {
-    c->flushed.store(true, std::memory_order_release);
+    // Build compact chunk: keep newest entries up to kMaxEntries.
+    compact_clean = new EvictChunk{};
+    compact_clean->page_id = leaf->page_id;
+    compact_clean->leaf = leaf;
+    compact_clean->is_clean_only = true;
+    compact_clean->num_entries = 0;
+
+    // Iterate in reverse (newest last in map → insert at tail, then oldest
+    // at head).  Actually, just fill compact_clean from the most recent entries
+    // and keep up to kMaxEntries.
+    size_t kept = 0;
+    for (auto it = merged.rbegin();
+         it != merged.rend() && kept < EvictChunk::kMaxEntries; ++it, ++kept) {
+      compact_clean->entries[kept].key = it->first;
+      compact_clean->entries[kept].value = it->second.first;
+      compact_clean->entries[kept].fp = fingerprint(it->first);
+      compact_clean->entries[kept].is_absent = it->second.second;
+    }
+    compact_clean->num_entries = kept;
   }
 
-  // ---- Phase 5: sweep flushed chunks from this leaf's chain ----
+  // ---- Phase 4: mark processed chunks for sweep ----
+  for (EvictChunk* c : dirty_to_flush) {
+    c->flushed.store(true, std::memory_order_release);
+  }
+  for (EvictChunk* c : clean_chunks) {
+    c->flushed.store(true, std::memory_order_release);  // will be freed (compacted)
+  }
+
+  // ---- Phase 5: sweep flushed chunks, insert compact at tail ----
   std::vector<EvictChunk*> freed;
+  size_t freed_dirty = 0;
   for (;;) {
     EvictChunk* old_head = leaf->chunk_head_.load(std::memory_order_acquire);
 
@@ -597,8 +688,20 @@ void Tree::flush_leaf(Node* leaf) {
         new_tail = h;
       } else {
         freed.push_back(h);
+        if (!h->is_clean_only) freed_dirty++;
       }
       h = next;
+    }
+
+    // Append compact clean chunk at tail (old end of chain).
+    // It represents merged old entries — searched after newer concurrent pushes.
+    if (compact_clean) {
+      compact_clean->next.store(nullptr, std::memory_order_release);
+      if (!new_head) {
+        new_head = compact_clean;
+      } else {
+        new_tail->next.store(compact_clean, std::memory_order_release);
+      }
     }
 
     if (leaf->chunk_head_.compare_exchange_weak(old_head, new_head,
@@ -606,6 +709,7 @@ void Tree::flush_leaf(Node* leaf) {
       break;
     }
     freed.clear();
+    freed_dirty = 0;
   }
 
   // ---- Phase 6: wait for in-flight readers, then free ----
@@ -616,8 +720,15 @@ void Tree::flush_leaf(Node* leaf) {
   for (EvictChunk* c : freed) {
     delete c;
   }
-  leaf->chunk_count_.fetch_sub(freed.size(), std::memory_order_relaxed);
-  total_chunk_count_.fetch_sub(freed.size(), std::memory_order_relaxed);
+  size_t freed_count = freed.size();
+  if (compact_clean) {
+    // Compact chunk replaces old clean chunks — account for the new chunk.
+    leaf->chunk_count_.fetch_add(1, std::memory_order_relaxed);
+    total_chunk_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+  leaf->chunk_count_.fetch_sub(freed_count, std::memory_order_relaxed);
+  leaf->dirty_chunk_count_.fetch_sub(freed_dirty, std::memory_order_relaxed);
+  total_chunk_count_.fetch_sub(freed_count, std::memory_order_relaxed);
 }
 
 // ---- Core operations ----
@@ -705,11 +816,13 @@ Status Tree::put(Key k, Value v) {
       if (s == Status::Ok) {
         if (leaf->version.load(std::memory_order_acquire) != leaf_v) continue;
         evict_leaf_if_needed(leaf);
-        // Deferred batch flush: only flush when enough chunks have
-        // accumulated across the tree to make the SSD I/O worthwhile.
-        if (total_chunk_count_.load(std::memory_order_acquire) >=
-          static_cast<size_t>(flush_batch_threshold_)) {
-          flush_leaf(leaf);
+        // Deferred batch flush: trigger when chunk counts cross threshold.
+        {
+          size_t dc = leaf->dirty_chunk_count_.load(std::memory_order_acquire);
+          size_t tc = leaf->chunk_count_.load(std::memory_order_acquire);
+              if (dc > 16 || tc > 20) {
+            flush_leaf(leaf);
+          }
         }
         return track_success();
       }
@@ -916,6 +1029,17 @@ LookupResult Tree::get(Key k) {
 
     auto try_place = [&](CacheAttachment* cache) -> bool {
       Status ps = cache->try_place_placeholder(k, &placeholder_idx);
+      if (ps == Status::Full) {
+        // Make room so the read path can place new placeholders.
+        // cache_B → evict_to_chunk (CLOCK-driven, may create dirty/clean chunk);
+        // cache_A → evict_cache_A_if_needed (CLOCK victim, demote dirty to cache_B).
+        if (cache == leaf->cache_B.get()) {
+          evict_to_chunk(leaf);
+        } else {
+          evict_cache_A_if_needed(leaf);
+        }
+        ps = cache->try_place_placeholder(k, &placeholder_idx);
+      }
       if (ps == Status::Ok) {
         ph_cache = cache;
         has_placed = true;
@@ -1131,38 +1255,82 @@ Status Tree::debug_flush_all() {
     // 1. Evict all leaf caches to per-leaf chunks.
     for (Node* leaf : leaves) {
       std::lock_guard<std::mutex> lock(leaf->eviction_mutex);
+
+      // Phase 1: flush dirty → dirty chunk.
       std::vector<std::pair<Key, Value>> dirty;
       leaf->cache_B->flush_dirty(dirty);
-      if (dirty.empty()) {
-        leaf->cache_B->clear_clean_occupied();
+
+      // Phase 2: flush clean (Occupied+Absent) → clean chunk.
+      std::vector<std::pair<Key, Value>> clean;
+      std::vector<bool> clean_is_absent;
+      leaf->cache_B->collect_clean_clock(clean, clean_is_absent,
+                                         EvictChunk::kMaxEntries);
+
+      if (dirty.empty() && clean.empty()) {
+        leaf->cache_B->clear_clean_occupied();  // fallback
         if (leaf->cache_B->occupied_count() > 0) any_entries = true;
         continue;
       }
       any_entries = true;
-      auto* chunk = new EvictChunk{};
-      chunk->page_id = leaf->page_id;
-      chunk->leaf = leaf;
-      chunk->num_entries = dirty.size();
-      for (size_t i = 0; i < dirty.size(); ++i) {
-        chunk->entries[i].key = dirty[i].first;
-        chunk->entries[i].value = dirty[i].second;
-        chunk->entries[i].fp = fingerprint(dirty[i].first);
-      }
-      EvictChunk* old_head = leaf->chunk_head_.load(std::memory_order_acquire);
-      do {
-        chunk->next.store(old_head, std::memory_order_release);
-      } while (!leaf->chunk_head_.compare_exchange_weak(old_head, chunk,
-                                                         std::memory_order_acq_rel));
-      leaf->chunk_count_.fetch_add(1, std::memory_order_relaxed);
-      {
-        size_t t = total_chunk_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-        size_t p = peak_chunk_count_.load(std::memory_order_relaxed);
-        while (t > p && !peak_chunk_count_.compare_exchange_weak(p, t,
-            std::memory_order_relaxed)) {}
+
+      // Push dirty chunk.
+      if (!dirty.empty()) {
+        auto* chunk = new EvictChunk{};
+        chunk->page_id = leaf->page_id;
+        chunk->leaf = leaf;
+        chunk->num_entries = dirty.size();
+        chunk->is_clean_only = false;
+        for (size_t i = 0; i < dirty.size(); ++i) {
+          chunk->entries[i].key = dirty[i].first;
+          chunk->entries[i].value = dirty[i].second;
+          chunk->entries[i].fp = fingerprint(dirty[i].first);
+        }
+        EvictChunk* old_head = leaf->chunk_head_.load(std::memory_order_acquire);
+        do {
+          chunk->next.store(old_head, std::memory_order_release);
+        } while (!leaf->chunk_head_.compare_exchange_weak(old_head, chunk,
+                                                           std::memory_order_acq_rel));
+        leaf->chunk_count_.fetch_add(1, std::memory_order_relaxed);
+        leaf->dirty_chunk_count_.fetch_add(1, std::memory_order_relaxed);
+        {
+          size_t t = total_chunk_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+          size_t p = peak_chunk_count_.load(std::memory_order_relaxed);
+          while (t > p && !peak_chunk_count_.compare_exchange_weak(p, t,
+              std::memory_order_relaxed)) {}
+        }
+        for (const auto& [k, v] : dirty) {
+          leaf->cache_B->evict_clean_slot(k);
+        }
       }
 
-      for (const auto& [k, v] : dirty) {
-        leaf->cache_B->evict_clean_slot(k);
+      // Push clean chunk.
+      if (!clean.empty()) {
+        auto* chunk = new EvictChunk{};
+        chunk->page_id = leaf->page_id;
+        chunk->leaf = leaf;
+        chunk->num_entries = clean.size();
+        chunk->is_clean_only = true;
+        for (size_t i = 0; i < clean.size(); ++i) {
+          chunk->entries[i].key = clean[i].first;
+          chunk->entries[i].value = clean[i].second;
+          chunk->entries[i].fp = fingerprint(clean[i].first);
+          chunk->entries[i].is_absent = clean_is_absent[i];
+        }
+        EvictChunk* old_head = leaf->chunk_head_.load(std::memory_order_acquire);
+        do {
+          chunk->next.store(old_head, std::memory_order_release);
+        } while (!leaf->chunk_head_.compare_exchange_weak(old_head, chunk,
+                                                           std::memory_order_acq_rel));
+        leaf->chunk_count_.fetch_add(1, std::memory_order_relaxed);
+        {
+          size_t t = total_chunk_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+          size_t p = peak_chunk_count_.load(std::memory_order_relaxed);
+          while (t > p && !peak_chunk_count_.compare_exchange_weak(p, t,
+              std::memory_order_relaxed)) {}
+        }
+        for (size_t i = 0; i < clean.size(); ++i) {
+          leaf->cache_B->evict_clean_slot(clean[i].first);
+        }
       }
     }
 
@@ -1186,6 +1354,7 @@ Status Tree::debug_flush_all() {
           chunk->page_id = leaf->page_id;
           chunk->leaf = leaf;
           chunk->num_entries = dirty.size();
+          chunk->is_clean_only = false;
           for (size_t i = 0; i < dirty.size(); ++i) {
             chunk->entries[i].key = dirty[i].first;
             chunk->entries[i].value = dirty[i].second;
@@ -1197,6 +1366,7 @@ Status Tree::debug_flush_all() {
           } while (!leaf->chunk_head_.compare_exchange_weak(old_head, chunk,
                                                            std::memory_order_acq_rel));
           leaf->chunk_count_.fetch_add(1, std::memory_order_relaxed);
+          leaf->dirty_chunk_count_.fetch_add(1, std::memory_order_relaxed);
           {
             size_t t = total_chunk_count_.fetch_add(1, std::memory_order_relaxed) + 1;
             size_t p = peak_chunk_count_.load(std::memory_order_relaxed);
