@@ -904,12 +904,11 @@ LookupResult Tree::get(Key k) {
       return cr;
     }
 
-    // Placeholder placement: always attempt when p_placeholder_ > 0.
-    // The CMS access-frequency estimate chooses which cache to try first:
-    //   Hot keys (freq >= threshold) → cache_A first, fallback to cache_B
-    //   Cold keys (freq < threshold) → cache_B first, fallback to cache_A
-    // This protects cache_A from cold-key pollution while ensuring every
-    // read miss gets a placeholder somewhere.
+    // Placeholder placement: hot keys always go to cache_A; cold keys
+    // use cache_B with probability p_placeholder_.  No cross-cache fallback —
+    // if the target cache is full, evict a victim and retry once.  This keeps
+    // cache_A free of cold-key pollution and cache_B free of cold-key churn
+    // (when p_placeholder_ < 1.0).
     bool has_placed = false;
     int placeholder_idx = -1;
     CacheAttachment* ph_cache = nullptr;
@@ -937,21 +936,21 @@ LookupResult Tree::get(Key k) {
     uint64_t freq = cms_.estimate(k);
     bool hot = (freq >= static_cast<uint64_t>(cms_admission_threshold_));
 
-    if (p_placeholder_ >= 1.0) {
-      // Always place: CMS chooses which cache to try first.
-      if (hot) {
-        if (!try_place(leaf->cache_A.get())) try_place(leaf->cache_B.get());
-      } else {
-        if (!try_place(leaf->cache_B.get())) try_place(leaf->cache_A.get());
+    if (hot) {
+      // Hot key: always place in cache_A.  Evict if full, no fallback to B.
+      if (!try_place(leaf->cache_A.get())) {
+        evict_cache_A_if_needed(leaf);
+        try_place(leaf->cache_A.get());
       }
-    } else if (p_placeholder_ > 0.0) {
-      // Legacy Bernoulli: p_placeholder_ controls placement probability.
-      // When placing, still use CMS for cache selection.
-      if (std::bernoulli_distribution{p_placeholder_}(rng)) {
-        if (hot) {
-          if (!try_place(leaf->cache_A.get())) try_place(leaf->cache_B.get());
-        } else {
-          if (!try_place(leaf->cache_B.get())) try_place(leaf->cache_A.get());
+    } else {
+      // Cold key: p_placeholder_ controls whether to place in cache_B.
+      // Evict if full, no fallback to A.
+      if (p_placeholder_ >= 1.0 ||
+          (p_placeholder_ > 0.0 &&
+           std::bernoulli_distribution{p_placeholder_}(rng))) {
+        if (!try_place(leaf->cache_B.get())) {
+          evict_leaf_if_needed(leaf);
+          try_place(leaf->cache_B.get());
         }
       }
     }
