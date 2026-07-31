@@ -1686,6 +1686,10 @@ double Tree::memory_hit_rate() const {
   return static_cast<double>(hits) / static_cast<double>(total);
 }
 
+SsDPageStore::IoStats Tree::io_stats() const {
+  return ssd_->io_stats();
+}
+
 // ---- Hit-rate tracking ----
 
 void Tree::record_get_hit(bool memory) const {

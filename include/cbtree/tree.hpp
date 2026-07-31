@@ -87,6 +87,9 @@ class Tree {
   // This is the primary YCSB-compatible hit-rate query.
   double memory_hit_rate() const;
 
+  // SSD I/O counters (debug).
+  SsDPageStore::IoStats io_stats() const;
+
   // Enable or disable hit-rate tracking at runtime.
   // When disabled (false), get() performs zero additional atomic operations —
   // the tracking branch is perfectly predicted not-taken.  Default is enabled.
