@@ -1,0 +1,17 @@
+=== Running current (feat/batch-merge-flush) ===
+Date: 2026年 07月 31日 星期五 09:04:00 CST
+--- Workload A ---
+  Round 1: tput=598078.4 hit=103400.0% ssd=1034 height=1034 chunk=1034 peak=1034 rss=64.7
+  Round 2: tput=595648.5 hit=103300.0% ssd=1033 height=1033 chunk=1033 peak=1033 rss=64.6
+  Round 3: tput=600627.9 hit=104400.0% ssd=1044 height=1044 chunk=1044 peak=1044 rss=64.7
+
+--- Workload B ---
+  Round 1: tput=460044.6 hit=21600.0% ssd=216 height=216 chunk=216 peak=216 rss=41.2
+  Round 2: tput=459594.8 hit=21600.0% ssd=216 height=216 chunk=216 peak=216 rss=41.1
+  Round 3: tput=456279.6 hit=21600.0% ssd=216 height=216 chunk=216 peak=216 rss=41.2
+
+--- Workload C ---
+  Round 1: tput=462944.7 hit=20500.0% ssd=205 height=205 chunk=205 peak=205 rss=38.8
+  Round 2: tput=369931.8 hit=20600.0% ssd=206 height=206 chunk=206 peak=206 rss=38.9
+  Round 3: tput=465427.7 hit=20400.0% ssd=204 height=204 chunk=204 peak=204 rss=38.8
+

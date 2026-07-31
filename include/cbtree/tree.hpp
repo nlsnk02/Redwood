@@ -104,7 +104,6 @@ class Tree {
                                       std::vector<Node*>& leaves);
 
   Node* find_leaf_for_key(Node* parent, Key k);
-  void register_in_leaf_index(Node* leaf, Key k);
   Status evict_leaf_if_needed(Node* leaf);
   Status evict_to_chunk(Node* leaf);
   Status evict_cache_A_if_needed(Node* leaf);

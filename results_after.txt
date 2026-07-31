@@ -1,0 +1,15 @@
+--- Workload A ---
+  Round 1: tput=395440.6 ops/s  hit_rate=0.984144  ssd_access=1581
+  Round 2: tput=409450.8 ops/s  hit_rate=0.981506  ssd_access=1844
+  Round 3: tput=418583.5 ops/s  hit_rate=0.97613  ssd_access=2380
+  Round 4: tput=411882.0 ops/s  hit_rate=0.970804  ssd_access=2911
+--- Workload B ---
+  Round 1: tput=496725.9 ops/s  hit_rate=0.636982  ssd_access=68981
+  Round 2: tput=516160.3 ops/s  hit_rate=0.640829  ssd_access=68250
+  Round 3: tput=503561.5 ops/s  hit_rate=0.637393  ssd_access=68903
+  Round 4: tput=500590.8 ops/s  hit_rate=0.63754  ssd_access=68875
+--- Workload C ---
+  Round 1: tput=452670.5 ops/s  hit_rate=0.610655  ssd_access=77869
+  Round 2: tput=457566.4 ops/s  hit_rate=0.61299  ssd_access=77402
+  Round 3: tput=463477.8 ops/s  hit_rate=0.610015  ssd_access=77997
+  Round 4: tput=458881.2 ops/s  hit_rate=0.612005  ssd_access=77599

@@ -97,15 +97,6 @@ Node* Tree::find_leaf_for_key(Node* parent, Key k) {
   return cur;
 }
 
-void Tree::register_in_leaf_index(Node* leaf, Key k) {
-  std::lock_guard<std::mutex> lock(leaf->leaf_index_mutex);
-  auto it = std::lower_bound(leaf->leaf_keys.begin(), leaf->leaf_keys.end(), k);
-  if (it != leaf->leaf_keys.end() && *it == k) return;  // already exists
-  size_t idx = it - leaf->leaf_keys.begin();
-  leaf->leaf_keys.insert(it, k);
-  leaf->leaf_page_ids.insert(leaf->leaf_page_ids.begin() + idx, leaf->page_id);
-}
-
 Status Tree::evict_leaf_if_needed(Node* leaf) {
   if (leaf->cache_B->occupied_count() <=
       static_cast<int>(kCacheSlots * kLeafFillThreshold))
@@ -261,14 +252,10 @@ Status Tree::evict_cache_A_if_needed(Node* leaf) {
 }
 
 void Tree::flush_and_split_leaf(Node* leaf) {
-  std::lock_guard<std::mutex> lock(leaf->leaf_index_mutex);
-
-  std::sort(leaf->leaf_keys.begin(), leaf->leaf_keys.end());
-  auto last = std::unique(leaf->leaf_keys.begin(), leaf->leaf_keys.end());
-  leaf->leaf_keys.erase(last, leaf->leaf_keys.end());
-  leaf->leaf_page_ids.assign(leaf->leaf_keys.size(), leaf->page_id);
-
-  if (leaf->leaf_keys.size() > kLeafFanout) {
+  // Read current keys from SSD to check if the page is overfull.
+  std::vector<std::pair<Key, Value>> entries;
+  if (ssd_->dump_sorted(leaf->page_id, &entries) != Status::Ok) return;
+  if (entries.size() > kLeafFanout) {
     split_leaf(leaf);
   }
 }
@@ -459,8 +446,6 @@ void Tree::flush_leaf(Node* leaf) {
             target_leaf->cache_B->upsert(key, val);
           return;
         }
-        for (const auto& [key, val] : merged)
-          register_in_leaf_index(target_leaf, key);
         return;
       }
 
@@ -572,9 +557,7 @@ void Tree::flush_leaf(Node* leaf) {
             leaves[p]->cache_B->upsert(key, val);
           continue;
         }
-        for (const auto& [key, val] : groups[p])
-          register_in_leaf_index(leaves[p], key);
-      }
+        }
     };
 
     auto flush_batch_remote = [&](PageId pid,
@@ -585,19 +568,6 @@ void Tree::flush_leaf(Node* leaf) {
         Node* n = page_leaf[pid];
         for (const auto& [key, val] : entries) n->cache_B->upsert(key, val);
         return;
-      }
-
-      Node* n = page_leaf[pid];
-      if (overflow.empty()) {
-        for (const auto& [key, val] : entries)
-          register_in_leaf_index(n, key);
-      } else {
-        std::set<Key> overflow_keys;
-        for (const auto& [k, v] : overflow) overflow_keys.insert(k);
-        for (const auto& [key, val] : entries) {
-          if (overflow_keys.count(key)) continue;
-          register_in_leaf_index(n, key);
-        }
       }
 
       for (const auto& [key, val] : overflow) {
@@ -1388,12 +1358,11 @@ Status Tree::debug_flush_all() {
       leaves.clear();
       collect_leaves(root_, leaves);
       for (Node* leaf : leaves) {
-        std::lock_guard<std::mutex> lock(leaf->leaf_index_mutex);
-        std::sort(leaf->leaf_keys.begin(), leaf->leaf_keys.end());
-        auto last = std::unique(leaf->leaf_keys.begin(), leaf->leaf_keys.end());
-        leaf->leaf_keys.erase(last, leaf->leaf_keys.end());
-        leaf->leaf_page_ids.assign(leaf->leaf_keys.size(), leaf->page_id);
-        if (leaf->leaf_keys.size() > kLeafFanout) {
+        // Check if the page has more entries than kLeafFanout due to
+        // reader insertions that hit cache_B before flush cleaned it.
+        std::vector<std::pair<Key, Value>> entries;
+        if (ssd_->dump_sorted(leaf->page_id, &entries) != Status::Ok) continue;
+        if (entries.size() > kLeafFanout) {
           split_leaf(leaf);
         }
       }
@@ -1409,13 +1378,11 @@ Status Tree::debug_flush_all() {
     //    Split may create new leaves — they will be picked up in the
     //    next loop iteration if overflow entries were re-inserted there.
     for (Node* leaf : leaves) {
-      std::lock_guard<std::mutex> lock(leaf->leaf_index_mutex);
-      std::sort(leaf->leaf_keys.begin(), leaf->leaf_keys.end());
-      auto last = std::unique(leaf->leaf_keys.begin(), leaf->leaf_keys.end());
-      leaf->leaf_keys.erase(last, leaf->leaf_keys.end());
-      leaf->leaf_page_ids.assign(leaf->leaf_keys.size(), leaf->page_id);
+      // Check page fullness after flush — split any overfull leaves.
+      std::vector<std::pair<Key, Value>> entries;
+      if (ssd_->dump_sorted(leaf->page_id, &entries) != Status::Ok) continue;
 
-      if (leaf->leaf_keys.size() > kLeafFanout) {
+      if (entries.size() > kLeafFanout) {
         split_leaf(leaf);
       }
     }
@@ -1426,7 +1393,14 @@ void Tree::split_leaf(Node* leaf) {
   std::unique_lock<std::shared_mutex> lock(tree_mutex_);
   leaf->version.fetch_add(1, std::memory_order_acq_rel);
 
-  Key mid = leaf->leaf_keys[leaf->leaf_keys.size() / 2];
+  // Read current keys from the SSD page to find the median split point.
+  std::vector<std::pair<Key, Value>> entries;
+  Status read_s = ssd_->dump_sorted(leaf->page_id, &entries);
+  if (read_s != Status::Ok || entries.empty()) {
+    leaf->version.fetch_add(1, std::memory_order_acq_rel);
+    return;
+  }
+  Key mid = entries[entries.size() / 2].first;
 
   PageId new_right_id = 0;
   Status split_s = ssd_->split_page(leaf->page_id, mid, &new_right_id);
@@ -1440,25 +1414,6 @@ void Tree::split_leaf(Node* leaf) {
   L_right->cache_A = std::make_unique<CacheAttachment>();
   L_right->cache_B = std::make_unique<CacheAttachment>();
   L_right->page_id = new_right_id;
-
-  std::vector<Key> left_keys;
-  std::vector<PageId> left_pids;
-  std::vector<Key> right_keys;
-  std::vector<PageId> right_pids;
-
-  for (size_t i = 0; i < leaf->leaf_keys.size(); ++i) {
-    if (leaf->leaf_keys[i] < mid) {
-      left_keys.push_back(leaf->leaf_keys[i]);
-      left_pids.push_back(leaf->leaf_page_ids[i]);
-    } else {
-      right_keys.push_back(leaf->leaf_keys[i]);
-      right_pids.push_back(leaf->leaf_page_ids[i]);
-    }
-  }
-  leaf->leaf_keys = std::move(left_keys);
-  leaf->leaf_page_ids = std::move(left_pids);
-  L_right->leaf_keys = std::move(right_keys);
-  L_right->leaf_page_ids = std::move(right_pids);
 
   leaf->cache_A->split_into(mid, L_right->cache_A.get());
   leaf->cache_B->split_into(mid, L_right->cache_B.get());
@@ -1625,11 +1580,8 @@ void Tree::debug_clear_all_caches() {
 }
 
 bool Tree::debug_leaf_index_empty() const {
-  std::vector<const Node*> leaves;
-  collect_leaves(root_, leaves);
-  for (const Node* leaf : leaves) {
-    if (!leaf->leaf_keys.empty()) return false;
-  }
+  // leaf_keys/leaf_page_ids have been removed — the in-memory leaf index
+  // no longer exists. Always returns true for backward compatibility.
   return true;
 }
 

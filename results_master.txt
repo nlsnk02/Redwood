@@ -1,0 +1,17 @@
+=== Running master (master) ===
+Date: 2026年 07月 31日 星期五 09:04:37 CST
+--- Workload A ---
+  Round 1: tput=771881.9 hit=3000.0% ssd=30 height=30 chunk=30 peak=30 rss=87.8
+  Round 2: tput=787330.9 hit=2900.0% ssd=29 height=29 chunk=29 peak=29 rss=87.7
+  Round 3: tput=805955.6 hit=3000.0% ssd=30 height=30 chunk=30 peak=30 rss=87.6
+
+--- Workload B ---
+  Round 1: tput=634198.7 hit=2700.0% ssd=27 height=27 chunk=27 peak=27 rss=65.4
+  Round 2: tput=625772.8 hit=2700.0% ssd=27 height=27 chunk=27 peak=27 rss=65.3
+  Round 3: tput=626629.6 hit=2700.0% ssd=27 height=27 chunk=27 peak=27 rss=65.3
+
+--- Workload C ---
+  Round 1: tput=421237.1 hit=2700.0% ssd=27 height=27 chunk=27 peak=27 rss=63.0
+  Round 2: tput=426379.7 hit=2700.0% ssd=27 height=27 chunk=27 peak=27 rss=63.0
+  Round 3: tput=423383.8 hit=2700.0% ssd=27 height=27 chunk=27 peak=27 rss=62.9
+
