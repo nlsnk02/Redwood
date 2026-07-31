@@ -413,6 +413,7 @@ Status CacheAttachment::fill_placeholder(int idx, Value v) {
     }
     slots_[idx].value = v;
     slots_[idx].dirty.store(false, std::memory_order_release);  // data came from SSD
+    slots_[idx].clock_bit.store(true, std::memory_order_release);
     slots_[idx].generation.fetch_add(1, std::memory_order_relaxed);
     slots_[idx].seq.fetch_add(1, std::memory_order_release);  // even
     return Status::Ok;
@@ -449,6 +450,7 @@ Status CacheAttachment::fill_placeholder_absent(int idx) {
       return Status::Error;
     }
     slots_[idx].dirty.store(true, std::memory_order_release);
+    slots_[idx].clock_bit.store(true, std::memory_order_release);
     slots_[idx].generation.fetch_add(1, std::memory_order_relaxed);
     slots_[idx].seq.fetch_add(1, std::memory_order_release);  // even
     return Status::Ok;

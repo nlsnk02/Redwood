@@ -605,23 +605,32 @@ void Tree::flush_leaf(Node* leaf) {
       }
     }
 
-    // Build compact chunk: keep newest entries up to kMaxEntries.
+    // Build compact chunk: keep entries with highest CMS frequency estimates.
+    // CMS frequency reflects combined read-miss + write access count,
+    // approximating inter-reference recency (LIRS: lower IRR = hotter).
+    // Keys with zero CMS estimate (never incremented) are retained if space
+    // allows, to avoid discarding cold-but-valid cached entries prematurely.
+    std::vector<std::tuple<Key, Value, bool, uint64_t>> scored;
+    scored.reserve(merged.size());
+    for (const auto& [k, v] : merged) {
+      scored.emplace_back(k, v.first, v.second, cms_.estimate(k));
+    }
+    std::sort(scored.begin(), scored.end(),
+              [](const auto& a, const auto& b) {
+                return std::get<3>(a) > std::get<3>(b);
+              });
+
     compact_clean = new EvictChunk{};
     compact_clean->page_id = leaf->page_id;
     compact_clean->leaf = leaf;
     compact_clean->is_clean_only = true;
-    compact_clean->num_entries = 0;
 
-    // Iterate in reverse (newest last in map → insert at tail, then oldest
-    // at head).  Actually, just fill compact_clean from the most recent entries
-    // and keep up to kMaxEntries.
     size_t kept = 0;
-    for (auto it = merged.rbegin();
-         it != merged.rend() && kept < EvictChunk::kMaxEntries; ++it, ++kept) {
-      compact_clean->entries[kept].key = it->first;
-      compact_clean->entries[kept].value = it->second.first;
-      compact_clean->entries[kept].fp = fingerprint(it->first);
-      compact_clean->entries[kept].is_absent = it->second.second;
+    for (size_t i = 0; i < scored.size() && kept < EvictChunk::kMaxEntries; ++i, ++kept) {
+      compact_clean->entries[kept].key       = std::get<0>(scored[i]);
+      compact_clean->entries[kept].value     = std::get<1>(scored[i]);
+      compact_clean->entries[kept].fp        = fingerprint(std::get<0>(scored[i]));
+      compact_clean->entries[kept].is_absent  = std::get<2>(scored[i]);
     }
     compact_clean->num_entries = kept;
   }
@@ -1589,6 +1598,12 @@ bool Tree::debug_some_keys_in_leaf_cache() const {
     if (leaf->cache_B && leaf->cache_B->occupied_count() > 0) return true;
   }
   return false;
+}
+
+size_t Tree::debug_leaf_count() const {
+  std::vector<const Node*> leaves;
+  collect_leaves(root_, leaves);
+  return leaves.size();
 }
 
 size_t Tree::debug_chunk_count() const {
