@@ -252,12 +252,9 @@ Status Tree::evict_cache_A_if_needed(Node* leaf) {
 }
 
 void Tree::flush_and_split_leaf(Node* leaf) {
-  // Read current keys from SSD to check if the page is overfull.
-  std::vector<std::pair<Key, Value>> entries;
-  if (ssd_->dump_sorted(leaf->page_id, &entries) != Status::Ok) return;
-  if (entries.size() > kLeafFanout) {
-    split_leaf(leaf);
-  }
+  // Called only from the overflow path — page is already overfull.
+  // split_leaf reads the page once to get the median, then splits.
+  split_leaf(leaf);
 }
 
 // ---- Chunk chain lookup ----
@@ -1403,7 +1400,7 @@ void Tree::split_leaf(Node* leaf) {
   Key mid = entries[entries.size() / 2].first;
 
   PageId new_right_id = 0;
-  Status split_s = ssd_->split_page(leaf->page_id, mid, &new_right_id);
+  Status split_s = ssd_->split_page(leaf->page_id, mid, entries, &new_right_id);
   if (split_s != Status::Ok) {
     leaf->version.fetch_add(1, std::memory_order_acq_rel);
     return;

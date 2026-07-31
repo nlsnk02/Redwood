@@ -52,6 +52,11 @@ class SsDPageStore {
 
   Status dump_sorted(PageId id, std::vector<std::pair<Key, Value>>* out);
   Status split_page(PageId left_id, Key mid, PageId* new_right_id);
+  // Split using pre-loaded entries — skips the internal read_page.
+  // Caller must hold tree_mutex_ to serialise structural changes.
+  Status split_page(PageId left_id, Key mid,
+                    const std::vector<std::pair<Key, Value>>& entries,
+                    PageId* new_right_id);
 
  private:
   // Internal I/O helpers — caller must hold the appropriate page_lock.

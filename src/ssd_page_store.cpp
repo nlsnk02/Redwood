@@ -277,4 +277,41 @@ Status SsDPageStore::split_page(PageId left_id, Key mid, PageId* new_right_id) {
   return write_page_locked(right_id, right_page);
 }
 
+Status SsDPageStore::split_page(PageId left_id, Key mid,
+                                const std::vector<std::pair<Key, Value>>& entries,
+                                PageId* new_right_id) {
+  std::unique_lock<std::shared_mutex> left_lock(page_lock(left_id));
+
+  // Partition the pre-loaded entries (no read necessary).
+  std::vector<Record> left_records;
+  std::vector<Record> right_records;
+  for (const auto& [k, v] : entries) {
+    if (k < mid) {
+      left_records.push_back({k, v});
+    } else {
+      right_records.push_back({k, v});
+    }
+  }
+
+  PageId right_id = alloc_page();
+  *new_right_id = right_id;
+
+  // Write left page
+  std::array<std::byte, kPageSize> new_left_page{};
+  write_count(new_left_page, static_cast<uint32_t>(left_records.size()));
+  for (size_t i = 0; i < left_records.size(); ++i) {
+    *record_at(new_left_page, static_cast<uint32_t>(i)) = left_records[i];
+  }
+  Status s = write_page_locked(left_id, new_left_page);
+  if (s != Status::Ok) return s;
+
+  // Write right page
+  std::array<std::byte, kPageSize> right_page{};
+  write_count(right_page, static_cast<uint32_t>(right_records.size()));
+  for (size_t i = 0; i < right_records.size(); ++i) {
+    *record_at(right_page, static_cast<uint32_t>(i)) = right_records[i];
+  }
+  return write_page_locked(right_id, right_page);
+}
+
 }  // namespace cbtree
