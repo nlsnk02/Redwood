@@ -1,6 +1,5 @@
 #pragma once
 #include <atomic>
-#include <mutex>
 #include <cstddef>
 #include <vector>
 #include <utility>
@@ -9,20 +8,23 @@
 
 namespace cbtree {
 
+// CacheSlot: 32 B (down from 80 B after replacing slot_mutex + reordering).
+// Seqlock protocol:
+//   Writers: seq++(odd) → write fields → CAS state → gen++ → seq++(even)
+//   Readers: snapshot seq (must be even) → read fields → re-read seq (must match)
+// The slot_mutex is replaced by CAS on the atomic state field.
+// Key-level mutual exclusion (KeyLockTable) prevents same-key races.
+// Generation protects against ABA: evictors capture gen, and stale gens
+// don't match recycled slots.
 struct CacheSlot {
-  // Seqlock: writers increment before/after modifying slot fields (while holding
-  // slot_mutex).  Readers snapshot seq before reading; if odd or mismatched
-  // after, they retry.  This eliminates mutex acquisition from the read path.
-  mutable std::atomic<uint32_t> seq{0};
-
-  SlotState state{SlotState::Empty};
   Key key{};
   Value value{};
   Fingerprint fp{};
-  bool dirty{false};
+  std::atomic<bool> dirty{false};
   std::atomic<bool> clock_bit{false};
-  mutable std::mutex slot_mutex;
+  std::atomic<SlotState> state{SlotState::Empty};
   std::atomic<uint32_t> generation{0};  // incremented on reuse, for ABA detection
+  mutable std::atomic<uint32_t> seq{0}; // seqlock version number
 };
 
 class CacheAttachment {
@@ -49,6 +51,12 @@ class CacheAttachment {
   }
 
   Status pick_clock_victim(Key* out_key, Value* out_val, bool* out_dirty);
+  // Collect clean Occupied and Absent entries via CLOCK for read-buffer eviction.
+  // Does NOT modify slot state — caller must evict after chunk creation.
+  // out_is_absent[i] is true when entries[i] came from an Absent slot.
+  // Returns number of entries collected (0 if nothing eligible).
+  int collect_clean_clock(std::vector<std::pair<Key, Value>>& out,
+                          std::vector<bool>& out_is_absent, int max_count);
   // Two-phase eviction: find victim without clearing, then evict after SSD write.
   // Captures slot generation for ABA detection.
   Status find_clock_victim(Key* out_key, Value* out_val, bool* out_dirty,
