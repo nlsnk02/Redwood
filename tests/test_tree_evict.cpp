@@ -46,15 +46,21 @@ TEST_F(TreeEvictTest, LeafDirtyFlushesToSsd) {
   }
 }
 
-TEST_F(TreeEvictTest, FlushRegistersLeafIndex) {
+TEST_F(TreeEvictTest, FlushAndLeafIndexRemoved) {
   cbtree::Tree t{path_};
   t.set_probabilities(0.0, 0.0);
   t.put(1, 10);
   t.put(2, 20);
-  // Before flush, leaf index should be empty (lazy registration)
+  // leaf_keys/leaf_page_ids have been removed — always empty.
   EXPECT_TRUE(t.debug_leaf_index_empty());
-  // Force flush
   ASSERT_EQ(t.debug_flush_all(), cbtree::Status::Ok);
-  // After flush, leaf index should have entries
-  EXPECT_FALSE(t.debug_leaf_index_empty());
+  // Still empty after flush (in-memory leaf index no longer exists).
+  EXPECT_TRUE(t.debug_leaf_index_empty());
+  // Verify data is still reachable via SSD.
+  auto r1 = t.get(1);
+  ASSERT_EQ(r1.status, cbtree::Status::Ok);
+  EXPECT_EQ(r1.value, 10);
+  auto r2 = t.get(2);
+  ASSERT_EQ(r2.status, cbtree::Status::Ok);
+  EXPECT_EQ(r2.value, 20);
 }
