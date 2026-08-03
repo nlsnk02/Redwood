@@ -174,7 +174,8 @@ Status Tree::evict_to_chunk(Node* leaf) {
 }
 
 Status Tree::evict_cache_A_if_needed(Node* leaf) {
-  if (leaf->cache_A->occupied_count() <=
+  // Count Occupied + Placeholder: both consume a slot that could hold new data.
+  if (leaf->cache_A->live_count() <=
       static_cast<int>(kCacheSlots * kParentFillThreshold))
     return Status::Ok;
   Key victim_key = 0;
@@ -939,7 +940,12 @@ LookupResult Tree::get(Key k) {
     if (hot) {
       // Hot key: always place in cache_A.  Evict if full, no fallback to B.
       if (!try_place(leaf->cache_A.get())) {
+        get_evict_a_calls_.fetch_add(1, std::memory_order_relaxed);
+        int before = leaf->cache_A->live_count();
         evict_cache_A_if_needed(leaf);
+        int after = leaf->cache_A->live_count();
+        if (after < before)
+          get_evict_a_actual_.fetch_add(1, std::memory_order_relaxed);
         try_place(leaf->cache_A.get());
       }
     } else {
@@ -949,7 +955,12 @@ LookupResult Tree::get(Key k) {
           (p_placeholder_ > 0.0 &&
            std::bernoulli_distribution{p_placeholder_}(rng))) {
         if (!try_place(leaf->cache_B.get())) {
+          get_evict_b_calls_.fetch_add(1, std::memory_order_relaxed);
+          int before = leaf->cache_B->occupied_count();
           evict_leaf_if_needed(leaf);
+          int after = leaf->cache_B->occupied_count();
+          if (after < before)
+            get_evict_b_actual_.fetch_add(1, std::memory_order_relaxed);
           try_place(leaf->cache_B.get());
         }
       }

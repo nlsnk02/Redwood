@@ -93,6 +93,22 @@ class Tree {
   // Call reset_memory_hit_stats() after re-enabling to start a fresh window.
   void set_hit_tracking(bool on);
 
+  // Debug: eviction counters on the get() placeholder path.
+  struct EvictDebugCounters {
+    uint64_t evict_a_calls;
+    uint64_t evict_a_actual;
+    uint64_t evict_b_calls;
+    uint64_t evict_b_actual;
+  };
+  EvictDebugCounters evict_debug_counters() const {
+    return {
+      get_evict_a_calls_.load(std::memory_order_relaxed),
+      get_evict_a_actual_.load(std::memory_order_relaxed),
+      get_evict_b_calls_.load(std::memory_order_relaxed),
+      get_evict_b_actual_.load(std::memory_order_relaxed),
+    };
+  }
+
  private:
   Node* descend_to_leaf(Key k,
                         std::vector<std::pair<Node*, uint64_t>>& versions);
@@ -160,6 +176,12 @@ class Tree {
   // Master switch: when false, get() skips all counter increments.
   // Read-only on the hot path after initial setup — zero overhead when off.
   bool enable_hit_tracking_{true};
+
+  // Debug: eviction counters for get()-path placeholder eviction analysis.
+  mutable std::atomic<uint64_t> get_evict_a_calls_{0};
+  mutable std::atomic<uint64_t> get_evict_a_actual_{0};
+  mutable std::atomic<uint64_t> get_evict_b_calls_{0};
+  mutable std::atomic<uint64_t> get_evict_b_actual_{0};
 
   // Deferred flush: global chunk tracking and batch threshold.
   mutable std::atomic<size_t> total_chunk_count_{0};

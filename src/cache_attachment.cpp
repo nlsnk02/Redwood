@@ -35,6 +35,7 @@ Status CacheAttachment::upsert(Key k, Value v, bool known_new) {
         slots_[idx].clock_bit.store(true, std::memory_order_release);
         slots_[idx].generation.fetch_add(1, std::memory_order_relaxed);
         slots_[idx].seq.fetch_add(1, std::memory_order_release);
+        live_count_.fetch_add(1, std::memory_order_relaxed);
         return Status::Ok;
       }
       if (first_free < 0) first_free = static_cast<int>(idx);
@@ -54,6 +55,7 @@ Status CacheAttachment::upsert(Key k, Value v, bool known_new) {
         slots_[idx].clock_bit.store(true, std::memory_order_release);
         slots_[idx].generation.fetch_add(1, std::memory_order_relaxed);
         slots_[idx].seq.fetch_add(1, std::memory_order_release);
+        live_count_.fetch_add(1, std::memory_order_relaxed);
         return Status::Ok;
       }
       if (first_free < 0) first_free = static_cast<int>(idx);
@@ -97,6 +99,7 @@ Status CacheAttachment::upsert(Key k, Value v, bool known_new) {
       slots_[first_free].clock_bit.store(true, std::memory_order_release);
       slots_[first_free].generation.fetch_add(1, std::memory_order_relaxed);
       slots_[first_free].seq.fetch_add(1, std::memory_order_release);
+      live_count_.fetch_add(1, std::memory_order_relaxed);
     } else {
       // Slot was taken by another thread's key — rare race, caller retries.
       return Status::Full;
@@ -253,6 +256,7 @@ Status CacheAttachment::mark_absent(Key k) {
       slots_[first_free].dirty = true;
       slots_[first_free].generation.fetch_add(1, std::memory_order_relaxed);
       slots_[first_free].seq.fetch_add(1, std::memory_order_release);
+      live_count_.fetch_add(1, std::memory_order_relaxed);
       return Status::Ok;
     }
   }
@@ -311,6 +315,7 @@ Status CacheAttachment::try_place_placeholder(Key k, int* out_idx) {
       slots_[first_free].state = SlotState::Placeholder;
       slots_[first_free].generation.fetch_add(1, std::memory_order_relaxed);
       slots_[first_free].seq.fetch_add(1, std::memory_order_release);
+      live_count_.fetch_add(1, std::memory_order_relaxed);
       if (out_idx) *out_idx = static_cast<int>(first_free);
       return Status::Ok;
     }
@@ -380,6 +385,10 @@ int CacheAttachment::occupied_count() const {
   return count;
 }
 
+int CacheAttachment::live_count() const {
+  return live_count_.load(std::memory_order_relaxed);
+}
+
 Status CacheAttachment::pick_clock_victim(Key* out_key, Value* out_val,
                                          bool* out_dirty) {
   if (!out_key || !out_val || !out_dirty) return Status::Error;
@@ -422,6 +431,7 @@ Status CacheAttachment::pick_clock_victim(Key* out_key, Value* out_val,
       slots_[idx].seq.fetch_add(1, std::memory_order_release);
       slots_[idx].state = SlotState::Tombstone;
       tombstone_count_.fetch_add(1, std::memory_order_relaxed);
+      live_count_.fetch_sub(1, std::memory_order_relaxed);
       slots_[idx].clock_bit.store(false, std::memory_order_release);
       slots_[idx].seq.fetch_add(1, std::memory_order_release);
     }
@@ -439,6 +449,7 @@ Status CacheAttachment::pick_clock_victim(Key* out_key, Value* out_val,
     slots_[i].seq.fetch_add(1, std::memory_order_release);
     slots_[i].state = SlotState::Tombstone;
     tombstone_count_.fetch_add(1, std::memory_order_relaxed);
+    live_count_.fetch_sub(1, std::memory_order_relaxed);
     slots_[i].seq.fetch_add(1, std::memory_order_release);
     return Status::Ok;
   }
@@ -457,11 +468,12 @@ Status CacheAttachment::find_clock_victim(Key* out_key, Value* out_val,
     {
       std::lock_guard<std::mutex> lock(slots_[idx].slot_mutex);
       SlotState st = slots_[idx].state;
-      if (st == SlotState::Empty || st == SlotState::Placeholder ||
-          st == SlotState::Tombstone)
+      if (st == SlotState::Empty || st == SlotState::Tombstone)
         continue;
 
-      // OCCUPIED or ABSENT -- check clock bit
+      // OCCUPIED, ABSENT, or PLACEHOLDER — check clock bit.
+      // Placeholder clock_bit is always false (never accessed), so it is
+      // naturally the cheapest victim — evicted on first encounter.
       bool bit = slots_[idx].clock_bit.load(std::memory_order_acquire);
       if (bit) {
         slots_[idx].clock_bit.store(false, std::memory_order_release);
@@ -470,7 +482,8 @@ Status CacheAttachment::find_clock_victim(Key* out_key, Value* out_val,
 
       // Re-verify state and clock_bit
       if (slots_[idx].state != SlotState::Occupied &&
-          slots_[idx].state != SlotState::Absent) {
+          slots_[idx].state != SlotState::Absent &&
+          slots_[idx].state != SlotState::Placeholder) {
         continue;
       }
       if (slots_[idx].clock_bit.load(std::memory_order_acquire)) {
@@ -487,14 +500,17 @@ Status CacheAttachment::find_clock_victim(Key* out_key, Value* out_val,
     return Status::Ok;
   }
 
-  // Fallback: all non-empty/non-tombstone slots are PLACEHOLDERs
+  // Fallback: all non-empty/non-tombstone slots have clock_bit stuck at 1
+  // (should not happen in practice — at most 128 iterations clear all bits).
   for (int i = 0; i < kCacheSlots; ++i) {
     std::lock_guard<std::mutex> lock(slots_[i].slot_mutex);
-    if (slots_[i].state != SlotState::Placeholder) continue;
+    if (slots_[i].state == SlotState::Empty ||
+        slots_[i].state == SlotState::Tombstone)
+      continue;
 
     *out_key = slots_[i].key;
-    *out_val = 0;
-    *out_dirty = false;
+    *out_val = (slots_[i].state == SlotState::Placeholder) ? 0 : slots_[i].value;
+    *out_dirty = slots_[i].dirty;
     *out_idx = i;
     *out_gen = slots_[i].generation.load(std::memory_order_acquire);
     return Status::Ok;
@@ -518,6 +534,7 @@ bool CacheAttachment::evict_slot(int idx, Key expected_key, uint32_t expected_ge
   slots_[idx].seq.fetch_add(1, std::memory_order_release);
   slots_[idx].state = SlotState::Tombstone;
   tombstone_count_.fetch_add(1, std::memory_order_relaxed);
+  live_count_.fetch_sub(1, std::memory_order_relaxed);
   slots_[idx].clock_bit.store(false, std::memory_order_release);
   slots_[idx].seq.fetch_add(1, std::memory_order_release);
   return true;
@@ -567,6 +584,7 @@ Status CacheAttachment::split_into(Key mid, CacheAttachment* right) {
         target->slots_[idx].dirty = e.dirty;
         target->slots_[idx].clock_bit.store(false, std::memory_order_release);
         target->slots_[idx].seq.fetch_add(1, std::memory_order_release);
+        target->live_count_.fetch_add(1, std::memory_order_relaxed);
         placed = true;
         break;
       }
@@ -612,6 +630,7 @@ bool CacheAttachment::evict_clean_slot(Key k) {
     slots_[idx].seq.fetch_add(1, std::memory_order_release);
     slots_[idx].state = SlotState::Tombstone;
     tombstone_count_.fetch_add(1, std::memory_order_relaxed);
+    live_count_.fetch_sub(1, std::memory_order_relaxed);
     slots_[idx].clock_bit.store(false, std::memory_order_release);
     slots_[idx].seq.fetch_add(1, std::memory_order_release);
     return true;
@@ -626,6 +645,7 @@ void CacheAttachment::clear_clean_occupied() {
       slots_[i].seq.fetch_add(1, std::memory_order_release);
       slots_[i].state = SlotState::Tombstone;
       tombstone_count_.fetch_add(1, std::memory_order_relaxed);
+      live_count_.fetch_sub(1, std::memory_order_relaxed);
       slots_[i].clock_bit.store(false, std::memory_order_release);
       slots_[i].seq.fetch_add(1, std::memory_order_release);
     }
@@ -641,6 +661,7 @@ void CacheAttachment::clear() {
     slots_[i].seq.fetch_add(1, std::memory_order_release);
   }
   tombstone_count_.store(0, std::memory_order_relaxed);
+  live_count_.store(0, std::memory_order_relaxed);
 }
 
 std::vector<std::pair<Key, Value>> CacheAttachment::occupied_sorted() {
@@ -703,6 +724,7 @@ void CacheAttachment::rehash() {
     slots_[i].seq.fetch_add(1, std::memory_order_release);
   }
   tombstone_count_.store(0, std::memory_order_relaxed);
+  live_count_.store(0, std::memory_order_relaxed);
 
   // Re-insert using open addressing.
   for (const auto& e : entries) {
@@ -719,6 +741,7 @@ void CacheAttachment::rehash() {
         slots_[idx].dirty = e.dirty;
         slots_[idx].clock_bit.store(false, std::memory_order_release);
         slots_[idx].seq.fetch_add(1, std::memory_order_release);
+        live_count_.fetch_add(1, std::memory_order_relaxed);
         break;
       }
     }
