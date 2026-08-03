@@ -117,8 +117,10 @@ Status CacheAttachment::upsert(Key k, Value v, bool known_new) {
 
     if (st == SlotState::Empty) {
       if (known_new) {
-        if (cas_insert(slots_[idx], SlotState::Empty, fp, k, v, true))
+        if (cas_insert(slots_[idx], SlotState::Empty, fp, k, v, true)) {
+          live_count_.fetch_add(1, std::memory_order_relaxed);
           return Status::Ok;
+        }
         continue;  // CAS failed — another thread claimed this Empty, keep probing
       }
       if (first_free < 0) first_free = static_cast<int>(idx);
@@ -128,6 +130,7 @@ Status CacheAttachment::upsert(Key k, Value v, bool known_new) {
     if (st == SlotState::Tombstone) {
       if (known_new) {
         if (cas_insert(slots_[idx], SlotState::Tombstone, fp, k, v, true)) {
+          live_count_.fetch_add(1, std::memory_order_relaxed);
           tombstone_count_.fetch_sub(1, std::memory_order_relaxed);
           return Status::Ok;
         }
@@ -162,6 +165,7 @@ Status CacheAttachment::upsert(Key k, Value v, bool known_new) {
       return Status::Full;  // slot was taken by another thread
     }
     if (cas_insert(slots_[first_free], expected, fp, k, v, true)) {
+      live_count_.fetch_add(1, std::memory_order_relaxed);
       if (expected == SlotState::Tombstone) {
         tombstone_count_.fetch_sub(1, std::memory_order_relaxed);
       }
@@ -301,6 +305,7 @@ Status CacheAttachment::mark_absent(Key k) {
     slots_[first_free].dirty.store(true, std::memory_order_release);
     if (slots_[first_free].state.compare_exchange_strong(expected, SlotState::Absent,
                                                           std::memory_order_acq_rel)) {
+      live_count_.fetch_add(1, std::memory_order_relaxed);
       if (expected == SlotState::Tombstone) {
         tombstone_count_.fetch_sub(1, std::memory_order_relaxed);
       }
@@ -367,6 +372,7 @@ Status CacheAttachment::try_place_placeholder(Key k, int* out_idx) {
     slots_[first_free].key = k;
     if (slots_[first_free].state.compare_exchange_strong(expected, SlotState::Placeholder,
                                                           std::memory_order_acq_rel)) {
+      live_count_.fetch_add(1, std::memory_order_relaxed);
       if (expected == SlotState::Tombstone) {
         tombstone_count_.fetch_sub(1, std::memory_order_relaxed);
       }
@@ -509,6 +515,7 @@ Status CacheAttachment::pick_clock_victim(Key* out_key, Value* out_val,
       *out_key = slots_[idx].key;
       *out_val = slots_[idx].value;
       *out_dirty = slots_[idx].dirty.load(std::memory_order_acquire);
+      live_count_.fetch_sub(1, std::memory_order_relaxed);
       tombstone_count_.fetch_add(1, std::memory_order_relaxed);
       slots_[idx].clock_bit.store(false, std::memory_order_release);
       // Don't bump generation — evict_slot semantics: slot key/val still readable
@@ -525,6 +532,7 @@ Status CacheAttachment::pick_clock_victim(Key* out_key, Value* out_val,
       *out_key = slots_[i].key;
       *out_val = 0;
       *out_dirty = false;
+      live_count_.fetch_sub(1, std::memory_order_relaxed);
       tombstone_count_.fetch_add(1, std::memory_order_relaxed);
       return Status::Ok;
     }
@@ -662,6 +670,7 @@ bool CacheAttachment::evict_slot(int idx, Key expected_key, uint32_t expected_ge
       // This is extremely rare but can happen.
       return false;
     }
+    live_count_.fetch_sub(1, std::memory_order_relaxed);
     tombstone_count_.fetch_add(1, std::memory_order_relaxed);
     slots_[idx].clock_bit.store(false, std::memory_order_release);
     // Don't bump generation here — eviction changes state but doesn't
@@ -722,6 +731,7 @@ Status CacheAttachment::split_into(Key mid, CacheAttachment* right) {
         target->slots_[idx].dirty.store(e.dirty, std::memory_order_release);
         target->slots_[idx].clock_bit.store(false, std::memory_order_release);
         target->slots_[idx].seq.fetch_add(1, std::memory_order_release);
+        target->live_count_.fetch_add(1, std::memory_order_relaxed);
         placed = true;
         break;
       }
@@ -786,6 +796,7 @@ bool CacheAttachment::evict_clean_slot(Key k) {
     SlotState expected = st;
     if (slots_[idx].state.compare_exchange_strong(expected, SlotState::Tombstone,
                                                    std::memory_order_acq_rel)) {
+      live_count_.fetch_sub(1, std::memory_order_relaxed);
       tombstone_count_.fetch_add(1, std::memory_order_relaxed);
       slots_[idx].clock_bit.store(false, std::memory_order_release);
       return true;
@@ -816,6 +827,7 @@ void CacheAttachment::clear_clean_occupied() {
       // Re-check gen: if a concurrent put happened, it incremented gen.
       // The put's in-place update will detect state != Occupied and retry.
       // The data was clean (on SSD/chunk), so it's not lost.
+      live_count_.fetch_sub(1, std::memory_order_relaxed);
       tombstone_count_.fetch_add(1, std::memory_order_relaxed);
       slots_[i].clock_bit.store(false, std::memory_order_release);
     }
@@ -832,6 +844,7 @@ void CacheAttachment::clear() {
     slots_[i].seq.fetch_add(1, std::memory_order_release);
   }
   tombstone_count_.store(0, std::memory_order_relaxed);
+  live_count_.store(0, std::memory_order_relaxed);
 }
 
 std::vector<std::pair<Key, Value>> CacheAttachment::occupied_sorted() {
@@ -889,6 +902,7 @@ void CacheAttachment::rehash() {
 
   // Clear all slots to Empty, reset tombstones.
   clear();
+  live_count_.store(0, std::memory_order_relaxed);
 
   // Re-insert using open addressing (CAS-based, as in upsert).
   for (const auto& e : entries) {
@@ -907,6 +921,7 @@ void CacheAttachment::rehash() {
         slots_[idx].clock_bit.store(false, std::memory_order_release);
         slots_[idx].generation.fetch_add(1, std::memory_order_relaxed);
         slots_[idx].seq.fetch_add(1, std::memory_order_release);
+        live_count_.fetch_add(1, std::memory_order_relaxed);
         break;
       }
       slots_[idx].seq.fetch_add(1, std::memory_order_release);
@@ -925,6 +940,10 @@ void CacheAttachment::maybe_rehash() {
   // Reasoning: rehash clears all slots and rebuilds, which creates a
   // window where concurrent lookups see all-Empty slots and miss live
   // entries.  Natural tombstone recycling avoids this race entirely.
+}
+
+int CacheAttachment::live_count() const {
+  return live_count_.load(std::memory_order_relaxed);
 }
 
 }  // namespace cbtree

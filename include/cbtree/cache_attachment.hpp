@@ -39,6 +39,9 @@ class CacheAttachment {
   Status fill_placeholder(int idx, Value v);
   Status fill_placeholder_absent(int idx);
   int occupied_count() const;
+  // Count Occupied + Placeholder in a single pass — both types consume
+  // a slot that could otherwise be reused for a new entry.
+  int live_count() const;
 
   bool sorted_flag() const {
     return sorted_flag_.load(std::memory_order_acquire);
@@ -93,6 +96,7 @@ class CacheAttachment {
   std::atomic<bool> sorted_flag_{false};
   KeyLockTable key_locks_;
   std::atomic<int> tombstone_count_{0};
+  std::atomic<int> live_count_{0};  // Occupied + Placeholder, maintained atomically
 };
 
 }  // namespace cbtree
