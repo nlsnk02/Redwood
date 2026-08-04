@@ -53,6 +53,27 @@ class Tree {
   // Debug: verify height >= 3 nodes have no cache
   bool debug_height3_nodes_have_no_cache() const;
 
+  // Debug: count of leaf nodes
+  size_t debug_leaf_count() const;
+
+  // Debug: eviction counters on the get() placeholder path.
+  struct EvictDebugCounters {
+    uint64_t evict_a_calls;
+    uint64_t evict_a_actual;
+    uint64_t evict_b_calls;
+    uint64_t evict_b_actual;
+    uint64_t ph_collisions;  // times a thread found an existing placeholder
+  };
+  EvictDebugCounters evict_debug_counters() const {
+    return {
+      get_evict_a_calls_.load(std::memory_order_relaxed),
+      get_evict_a_actual_.load(std::memory_order_relaxed),
+      get_evict_b_calls_.load(std::memory_order_relaxed),
+      get_evict_b_actual_.load(std::memory_order_relaxed),
+      ph_collisions_.load(std::memory_order_relaxed),
+    };
+  }
+
   // Debug: chunk chain length
   size_t debug_chunk_count() const;
 
@@ -87,6 +108,9 @@ class Tree {
   // This is the primary YCSB-compatible hit-rate query.
   double memory_hit_rate() const;
 
+  // SSD I/O counters (debug).
+  SsDPageStore::IoStats io_stats() const;
+
   // Enable or disable hit-rate tracking at runtime.
   // When disabled (false), get() performs zero additional atomic operations —
   // the tracking branch is perfectly predicted not-taken.  Default is enabled.
@@ -104,7 +128,6 @@ class Tree {
                                       std::vector<Node*>& leaves);
 
   Node* find_leaf_for_key(Node* parent, Key k);
-  void register_in_leaf_index(Node* leaf, Key k);
   Status evict_leaf_if_needed(Node* leaf);
   Status evict_to_chunk(Node* leaf);
   Status evict_cache_A_if_needed(Node* leaf);
@@ -160,6 +183,13 @@ class Tree {
   // Master switch: when false, get() skips all counter increments.
   // Read-only on the hot path after initial setup — zero overhead when off.
   bool enable_hit_tracking_{true};
+
+  // Debug: eviction counters for get()-path placeholder eviction analysis.
+  mutable std::atomic<uint64_t> get_evict_a_calls_{0};
+  mutable std::atomic<uint64_t> get_evict_a_actual_{0};
+  mutable std::atomic<uint64_t> get_evict_b_calls_{0};
+  mutable std::atomic<uint64_t> get_evict_b_actual_{0};
+  mutable std::atomic<uint64_t> ph_collisions_{0};
 
   // Deferred flush: global chunk tracking and batch threshold.
   mutable std::atomic<size_t> total_chunk_count_{0};

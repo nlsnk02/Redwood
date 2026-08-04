@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstddef>
 #include <mutex>
@@ -52,6 +53,11 @@ class SsDPageStore {
 
   Status dump_sorted(PageId id, std::vector<std::pair<Key, Value>>* out);
   Status split_page(PageId left_id, Key mid, PageId* new_right_id);
+  // Split using pre-loaded entries — skips the internal read_page.
+  // Caller must hold tree_mutex_ to serialise structural changes.
+  Status split_page(PageId left_id, Key mid,
+                    const std::vector<std::pair<Key, Value>>& entries,
+                    PageId* new_right_id);
 
  private:
   // Internal I/O helpers — caller must hold the appropriate page_lock.
@@ -76,6 +82,25 @@ class SsDPageStore {
   // DIO bounce buffer — thread_local since per-page locking allows
   // concurrent I/O from multiple threads.
   static thread_local std::array<std::byte, kPageSize> tl_dio_buf_;
+
+ public:
+  // I/O operation counters (debug — atomic for concurrent access).
+  struct IoStats {
+    uint64_t reads = 0;
+    uint64_t writes = 0;
+    uint64_t dump_sorted = 0;
+    uint64_t splits = 0;
+    uint64_t write_entries = 0;
+  };
+  IoStats io_stats() const;
+  void reset_io_stats();
+
+ private:
+  mutable std::atomic<uint64_t> io_reads_{0};
+  mutable std::atomic<uint64_t> io_writes_{0};
+  mutable std::atomic<uint64_t> io_dump_sorted_{0};
+  mutable std::atomic<uint64_t> io_splits_{0};
+  mutable std::atomic<uint64_t> io_write_entries_{0};
 };
 
 }  // namespace cbtree

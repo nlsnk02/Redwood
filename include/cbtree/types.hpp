@@ -44,7 +44,7 @@ inline constexpr size_t kPageSize = 4096;
 inline constexpr double kParentFillThreshold = 0.8;
 inline constexpr double kLeafFillThreshold = 0.8;
 inline constexpr double kDefaultPParent = 0.23;
-inline constexpr double kDefaultPPlaceholder = 1.0;
+inline constexpr double kDefaultPPlaceholder = 0.75;
 
 // Count-Min Sketch parameters for frequency-based cache admission.
 // d=4 rows × w=1024 columns → 32 KB, ε≈e/1024≈0.27%, δ≈e^{-4}≈1.8%
