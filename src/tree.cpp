@@ -98,7 +98,11 @@ Node* Tree::find_leaf_for_key(Node* parent, Key k) {
 }
 
 Status Tree::evict_leaf_if_needed(Node* leaf) {
-  if (leaf->cache_B->occupied_count() <=
+  // Count Occupied + Placeholder: placeholder-only slots can't accept new
+  // entries and must be evictable.  pick_clock_victim has a fallback path
+  // that clears Placeholder slots when no Occupied/Absent victim is found,
+  // so triggering eviction on live_count() is safe.
+  if (leaf->cache_B->live_count() <=
       static_cast<int>(kCacheSlots * kLeafFillThreshold))
     return Status::Ok;
   Status s = evict_to_chunk(leaf);
@@ -149,13 +153,15 @@ Status Tree::evict_to_chunk(Node* leaf) {
     pushed_dirty = true;
   }
 
-  // ---- Phase 2: if still near capacity, flush clean entries → clean chunk ----
-  // Clean chunks are a read buffer — entries already on SSD, no I/O needed on flush.
+  // Phase 2: Use live_count() (Occupied + Placeholder) so that
+  // placeholder-heavy caches still trigger clean-entry collection.
+  // Clean entries go into a clean chunk (read buffer) instead of being
+  // dropped — lookup_chunks() will find them on subsequent reads.
   std::vector<std::pair<Key, Value>> clean;
   std::vector<bool> clean_is_absent;
   bool pushed_clean = false;
 
-  if (leaf->cache_B->occupied_count() >
+  if (leaf->cache_B->live_count() >
       static_cast<int>(kCacheSlots * kLeafFillThreshold)) {
     int n = leaf->cache_B->collect_clean_clock(clean, clean_is_absent, 16);
     if (n > 0) {
@@ -201,9 +207,47 @@ Status Tree::evict_to_chunk(Node* leaf) {
     }
   }
 
-  // Fallback: if nothing was pushed (no dirty, no clean eligible), wipe all clean.
+  // Fallback: if nothing was pushed (no dirty, no clean eligible in Phase 2
+  // because occupied_count alone was low), try collecting clean entries again
+  // and push them to a clean chunk.  This preserves data in the chunk chain
+  // instead of wiping it with clear_clean_occupied() — the chunk acts as a
+  // read buffer that lookup_chunks() will find on subsequent accesses.
   if (!pushed_dirty && !pushed_clean) {
-    leaf->cache_B->clear_clean_occupied();
+    int n = leaf->cache_B->collect_clean_clock(clean, clean_is_absent, 16);
+    if (n > 0) {
+      auto* chunk = new EvictChunk{};
+      chunk->page_id = leaf->page_id;
+      chunk->leaf = leaf;
+      chunk->num_entries = static_cast<size_t>(n);
+      chunk->is_clean_only = true;
+      for (int i = 0; i < n; ++i) {
+        chunk->entries[i].key = clean[i].first;
+        chunk->entries[i].value = clean[i].second;
+        chunk->entries[i].fp = fingerprint(clean[i].first);
+        chunk->entries[i].is_absent = clean_is_absent[i];
+      }
+      {
+        EvictChunk* old_head = leaf->chunk_head_.load(std::memory_order_acquire);
+        do {
+          chunk->next.store(old_head, std::memory_order_release);
+        } while (!leaf->chunk_head_.compare_exchange_weak(old_head, chunk,
+                                                           std::memory_order_acq_rel));
+      }
+      leaf->chunk_count_.fetch_add(1, std::memory_order_relaxed);
+      {
+        size_t t = total_chunk_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        size_t p = peak_chunk_count_.load(std::memory_order_relaxed);
+        while (t > p && !peak_chunk_count_.compare_exchange_weak(p, t,
+            std::memory_order_relaxed)) {}
+      }
+      // Clear the collected slots from cache_B.
+      for (const auto& [k, v] : clean) {
+        leaf->cache_B->evict_clean_slot(k);
+      }
+    } else {
+      // Truly nothing collectable — last resort.
+      leaf->cache_B->clear_clean_occupied();
+    }
     return Status::Ok;
   }
 
@@ -246,6 +290,14 @@ Status Tree::evict_cache_A_if_needed(Node* leaf) {
           flush_leaf(leaf);
         }
       }
+    }
+  } else {
+    // Clean victim: also demote to cache_B — without this, read-only
+    // hot keys are simply dropped from cache_A and must be re-read from
+    // SSD (or the chunk chain) on next access, hurting read-only hit rates.
+    if (leaf->cache_B) {
+      evict_leaf_if_needed(leaf);
+      leaf->cache_B->upsert(victim_key, victim_val);
     }
   }
   leaf->cache_A->evict_slot(victim_idx, victim_key, victim_gen);
