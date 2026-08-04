@@ -318,7 +318,7 @@ Status CacheAttachment::mark_absent(Key k) {
   return Status::Full;
 }
 
-Status CacheAttachment::try_place_placeholder(Key k, int* out_idx) {
+Status CacheAttachment::try_place_placeholder(Key k, int* out_idx, bool* found_existing) {
   KeyLockGuard key_guard(key_locks_, k);
   Fingerprint fp = fingerprint(k);
   size_t start = fp % kCacheSlots;
@@ -349,8 +349,10 @@ Status CacheAttachment::try_place_placeholder(Key k, int* out_idx) {
     if (sk != k) continue;
 
     if (st == SlotState::Placeholder) {
-      // Placeholder already exists for this key
+      // Placeholder already exists for this key — another thread is already
+      // fetching from SSD.  Caller can avoid a duplicate SSD read.
       if (out_idx) *out_idx = static_cast<int>(idx);
+      if (found_existing) *found_existing = true;
       return Status::Ok;
     }
     // Key already exists as Occupied or Absent — no placeholder needed

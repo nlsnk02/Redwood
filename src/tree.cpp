@@ -1054,15 +1054,43 @@ LookupResult Tree::get(Key k) {
     bool has_placed = false;
     int placeholder_idx = -1;
     CacheAttachment* ph_cache = nullptr;
+    bool spin_got_value = false;
+    LookupResult spin_result;
 
     auto try_place = [&](CacheAttachment* cache) -> bool {
-      Status s = cache->try_place_placeholder(k, &placeholder_idx);
-      if (s == Status::Ok) {
-        has_placed = true;
-        ph_cache = cache;
-        return true;
+      bool found_existing = false;
+      Status s = cache->try_place_placeholder(k, &placeholder_idx, &found_existing);
+      if (s != Status::Ok) return false;  // cache full, caller should evict
+
+      if (found_existing) {
+        ph_collisions_.fetch_add(1, std::memory_order_relaxed);
+        // Another thread is already reading this key from SSD — spin-wait
+        // for it to fill the placeholder so we can skip a duplicate SSD read.
+        //
+        // Natural eviction protection: lookup(k) sets clock_bit=true on the
+        // placeholder slot.  pick_clock_victim's main loop skips clock_bit=true
+        // slots (second-chance policy), and skips Placeholder state entirely
+        // in its primary pass.  The fallback pass (all-slot-Placeholder) only
+        // triggers when EVERY slot is Placeholder — impossible while any
+        // spinning thread's lookup() has set a clock_bit on a non-Placeholder
+        // slot elsewhere in the cache.  So the placeholder is safe from CLOCK
+        // eviction while at least one waiter is spinning.
+        static constexpr int kMaxSpin = 128;
+        for (int spin = 0; spin < kMaxSpin; ++spin) {
+          LookupResult lr = cache->lookup(k);
+          if (lr.status == Status::Ok) {
+            spin_got_value = true;
+            spin_result = lr;
+            return false;  // got the value, no SSD read needed
+          }
+          if (lr.placeholder_idx < 0) break;  // placeholder evicted, fall through
+        }
+        // Timeout or evicted — fall through to normal SSD read path.
       }
-      return false;
+
+      has_placed = true;
+      ph_cache = cache;
+      return true;
     };
 
     // Increment CMS on read miss — tracks read access frequency alongside
@@ -1082,6 +1110,7 @@ LookupResult Tree::get(Key k) {
     if (hot) {
       // Hot key: always place in cache_A.  Evict if full, no fallback to B.
       if (!try_place(leaf->cache_A.get())) {
+        if (spin_got_value) { record_get_hit(true); return spin_result; }
         get_evict_a_calls_.fetch_add(1, std::memory_order_relaxed);
         int before = leaf->cache_A->live_count();
         evict_cache_A_if_needed(leaf);
@@ -1097,6 +1126,7 @@ LookupResult Tree::get(Key k) {
           (p_placeholder_ > 0.0 &&
            std::bernoulli_distribution{p_placeholder_}(rng))) {
         if (!try_place(leaf->cache_B.get())) {
+          if (spin_got_value) { record_get_hit(true); return spin_result; }
           get_evict_b_calls_.fetch_add(1, std::memory_order_relaxed);
           int before = leaf->cache_B->occupied_count();
           evict_leaf_if_needed(leaf);
@@ -1107,6 +1137,9 @@ LookupResult Tree::get(Key k) {
         }
       }
     }
+
+    // Spin-wait succeeded — return without SSD read.
+    if (spin_got_value) { record_get_hit(true); return spin_result; }
 
     // Query SSD
     LookupResult r = ssd_->get_record(leaf->page_id, k);

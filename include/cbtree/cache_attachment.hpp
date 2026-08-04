@@ -35,7 +35,7 @@ class CacheAttachment {
   LookupResult lookup(Key k);
   bool has_absent(Key k) const;
   Status mark_absent(Key k);
-  Status try_place_placeholder(Key k, int* out_idx);
+  Status try_place_placeholder(Key k, int* out_idx, bool* found_existing = nullptr);
   Status fill_placeholder(int idx, Value v);
   Status fill_placeholder_absent(int idx);
   int occupied_count() const;

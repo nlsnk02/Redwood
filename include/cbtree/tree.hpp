@@ -62,6 +62,7 @@ class Tree {
     uint64_t evict_a_actual;
     uint64_t evict_b_calls;
     uint64_t evict_b_actual;
+    uint64_t ph_collisions;  // times a thread found an existing placeholder
   };
   EvictDebugCounters evict_debug_counters() const {
     return {
@@ -69,6 +70,7 @@ class Tree {
       get_evict_a_actual_.load(std::memory_order_relaxed),
       get_evict_b_calls_.load(std::memory_order_relaxed),
       get_evict_b_actual_.load(std::memory_order_relaxed),
+      ph_collisions_.load(std::memory_order_relaxed),
     };
   }
 
@@ -187,6 +189,7 @@ class Tree {
   mutable std::atomic<uint64_t> get_evict_a_actual_{0};
   mutable std::atomic<uint64_t> get_evict_b_calls_{0};
   mutable std::atomic<uint64_t> get_evict_b_actual_{0};
+  mutable std::atomic<uint64_t> ph_collisions_{0};
 
   // Deferred flush: global chunk tracking and batch threshold.
   mutable std::atomic<size_t> total_chunk_count_{0};
